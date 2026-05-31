@@ -17,11 +17,21 @@
 
 ### Install
 
-```bash
-# via pi install (recommended)
-pi install git:github.com/ruanbw/pi-deepseek-cache
+**npm (recommended)**
 
-# or manually
+```bash
+pi install npm:pi-deepseek-cache
+```
+
+**Git**
+
+```bash
+pi install git:github.com/ruanbw/pi-deepseek-cache
+```
+
+**Manual**
+
+```bash
 mkdir -p ~/.pi/agent/extensions/deepseek-cache
 cp index.ts ~/.pi/agent/extensions/deepseek-cache/
 ```
@@ -71,11 +81,21 @@ MIT
 
 ### 安装
 
-```bash
-# 通过 pi install 安装（推荐）
-pi install git:github.com/ruanbw/pi-deepseek-cache
+**npm（推荐）**
 
-# 或手动安装
+```bash
+pi install npm:pi-deepseek-cache
+```
+
+**Git**
+
+```bash
+pi install git:github.com/ruanbw/pi-deepseek-cache
+```
+
+**手动**
+
+```bash
 mkdir -p ~/.pi/agent/extensions/deepseek-cache
 cp index.ts ~/.pi/agent/extensions/deepseek-cache/
 ```
