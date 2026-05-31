@@ -15,7 +15,9 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "eslint . && prettier --check .",
+    "lint:fix": "eslint --fix . && prettier --write ."
   },
   "keywords": [
     "pi",
@@ -28,12 +30,16 @@
   "author": "ruanbw",
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/pi-ai": ">=0.78.0",
-    "@earendil-works/pi-coding-agent": ">=0.78.0",
-    "@earendil-works/pi-tui": ">=0.78.0"
+    "@earendil-works/pi-ai": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-tui": "^0.78.0"
   },
   "devDependencies": {
-    "vitest": "^3.2.0"
+    "vitest": "^3.2.0",
+    "eslint": "^9.0.0",
+    "@eslint/js": "^9.0.0",
+    "typescript-eslint": "^8.0.0",
+    "prettier": "^3.0.0"
   },
   "pi": {
     "extensions": ["./index.ts"]
