@@ -32,12 +32,14 @@ In long agent sessions that's surprisingly hard:
 ## 🎯 Features
 
 - **Prefix Guard** — strips `volatile-scratch` messages from the context to keep the byte prefix stable across turns
-- **Cache Break Diagnostics** — detects when the cache prefix unexpectedly changes and notifies you immediately
+- **Stable Tool Ordering** — lexicographically sorts `tools` in `before_provider_request` (Harness `orderTools` parity) so tool-list order jitter never breaks the cache
+- **Cache Break Diagnostics** — prefix-inclusion detection (stable-JSON + SHA-256) warns only when an existing prefix is rewritten, not on normal append; empty/unknown payloads are silently skipped
 - **Hit Rate Telemetry** — accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from every response and persists to disk
 - **Live Status Bar** — see hit rate and turn count in the Pi footer after every message
-- **ASCII Trend Chart** — visualize cache hit rate over time with `/cache-graph`
+- **ASCII Trend Chart** — visualize cache hit rate over time with `/cache-graph` (flat-rate handling + fixed chart labels)
 - **Cost Savings Estimation** — estimated dollar savings displayed in `/cache-stats`
-- **Cache-Friendly Compaction** — uses `deepseek-v4-flash` (temperature: 0) for deterministic summarization, with SHA-256–cached results persisted across sessions
+- **Cache-Friendly Compaction** — uses `deepseek-v4-flash` (temperature: 0) for deterministic summarization, with SHA-256–cached results persisted across sessions (LRU capped at 64)
+- **Atomic Persistence** — `tmp + rename` writes + debounced async flush + `session_start`/`session_shutdown` lifecycle guarantees, no torn JSON
 - **`/cache-reset`** — clear all stats, history, and summary cache with one command
 
 ## 📦 Installation
@@ -75,13 +77,13 @@ pi --model deepseek/deepseek-chat
 
 ## 🔍 How it works
 
-| Layer | What it does |
-|-------|-------------|
-| **P1 — Telemetry** | Accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from `message_end` events, persists to `~/.pi/agent/extensions/deepseek-cache/stats.json` |
-| **P2 — Prefix Guard** | Filters out messages with `customType="volatile-scratch"` in the `context` hook, preventing volatile content from breaking the byte prefix. Monitors prefix hashes and alerts on unexpected changes. |
-| **P3 — Compaction** | On `session_before_compact`, summarizes history with `deepseek-v4-flash` at temperature 0. Summaries are cached by SHA-256 hash and persisted to disk for cross-session reuse. |
+| Layer | What it does | Harness lineage |
+|-------|-------------|-----------------|
+| **P1 — Telemetry** | Accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from `message_end` events, persists atomically to `~/.pi/agent/extensions/deepseek-cache/stats.json` | `TokenUsage` DISJOINT (`translate.ts:mapUsage`) — `input = prompt_tokens - cacheRead` |
+| **P2 — Prefix Guard** | Filters `volatile-scratch` in `context`; sorts `tools` lexicographically in `before_provider_request`; monitors prefix hashes with stable-JSON + inclusion check | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals` (`packages/core/system-prompt`, `packages/core/session`) |
+| **P3 — Compaction** | On `session_before_compact`, summarizes history with `deepseek-v4-flash` at temperature 0. Summaries are SHA-256–cached (LRU 64) and atomically persisted | `compaction-basic/summarizer.ts` verbatim replay — `system+tools+shadowed messages` + trailing instruction |
 
-> 📖 More on the underlying mechanism: [DeepSeek Context Caching docs](https://api-docs.deepseek.com/guides/kv_cache)
+> 📖 Deep dive: [Prefix Cache Principle](./docs/prefix-cache-principle.md) — official [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache) (3 persistence timings, 64-token units, best-effort) + Harness 5-layer enforcement + Pi mapping
 
 ## 🛠️ Troubleshooting
 

@@ -32,12 +32,14 @@ DeepSeek API 内置了**磁盘上下文缓存**：任何提示**前缀**与之�
 ## 🎯 功能特性
 
 - **前缀守卫** — 从上下文中剥离 `volatile-scratch` 消息，保持字节前缀跨轮次稳定
-- **缓存破坏诊断** — 检测到缓存前缀意外变化时立即通知
+- **稳定工具排序** — 在 `before_provider_request` 中按字典序排序 `tools`（对齐 Harness `orderTools`），工具顺序抖动不再击穿缓存
+- **缓存破坏诊断** — 稳定 JSON + SHA-256 的前缀包含检测，仅在既有前缀被改写时告警，正常追加不打扰；空/未知 payload 静默跳过
 - **命中率遥测** — 从每次响应中累计 `cacheRead` / `input` / `cacheWrite` / `turns`，持久化到磁盘
 - **实时状态栏** — 每条消息后在 Pi 底栏显示命中率和轮次
-- **ASCII 趋势图** — 使用 `/cache-graph` 可视化缓存命中率趋势
+- **ASCII 趋势图** — 使用 `/cache-graph` 可视化缓存命中率趋势（平坦率特判 + 定点标签）
 - **成本节省估算** — 在 `/cache-stats` 中显示预估节省金额
-- **缓存友好的 compaction** — 使用 `deepseek-v4-flash`（temperature: 0）做确定性摘要，SHA-256 缓存结果跨会话复用
+- **缓存友好的 compaction** — 使用 `deepseek-v4-flash`（temperature: 0）做确定性摘要，SHA-256 缓存结果跨会话复用（LRU 上限 64）
+- **原子持久化** — `tmp + rename` 原子写入 + 防抖异步落盘 + `session_start`/`session_shutdown` 生命周期保障，无撕裂 JSON
 - **`/cache-reset`** — 一条命令清空所有统计、历史和摘要缓存
 
 ## 📦 安装
@@ -75,13 +77,13 @@ pi --model deepseek/deepseek-chat
 
 ## 🔍 工作原理
 
-| 层 | 说明 |
-|----|------|
-| **P1 — 遥测** | 在 `message_end` 事件中累计 `cacheRead` / `input` / `cacheWrite` / `turns`，持久化到 `~/.pi/agent/extensions/deepseek-cache/stats.json` |
-| **P2 — 前缀守卫** | 在 `context` 钩子中过滤 `customType="volatile-scratch"` 的消息，防止易变内容破坏字节前缀。监控前缀哈希并在意外变化时告警。 |
-| **P3 — Compaction** | 在 `session_before_compact` 时用 `deepseek-v4-flash`（temperature: 0）做摘要，按 SHA-256 hash 缓存并持久化到磁盘，支持跨会话复用。 |
+| 层 | 说明 | Harness 谱系 |
+|----|------|-------------|
+| **P1 — 遥测** | 在 `message_end` 事件中累计 `cacheRead` / `input` / `cacheWrite` / `turns`，原子持久化到 `~/.pi/agent/extensions/deepseek-cache/stats.json` | `TokenUsage` DISJOINT（`translate.ts:mapUsage`）—— `input = prompt_tokens - cacheRead` |
+| **P2 — 前缀守卫** | 在 `context` 中过滤 `volatile-scratch`；在 `before_provider_request` 中按字典序排序 `tools`；稳定 JSON + 包含检测监控前缀 | `orderTools` / `sameSchema` / `canonicalHeader` / `headerEquals`（`packages/core/system-prompt`、`packages/core/session`） |
+| **P3 — Compaction** | 在 `session_before_compact` 时用 `deepseek-v4-flash`（temperature: 0）做摘要，SHA-256 缓存（LRU 64）并原子持久化 | `compaction-basic/summarizer.ts` verbatim 回放——`system+tools+shadowed messages` + 尾部指令 |
 
-> 📖 底层机制详见：[DeepSeek 上下文缓存文档](https://api-docs.deepseek.com/guides/kv_cache)
+> 📖 深入原理：[前缀缓存原理](./docs/prefix-cache-principle.md) —— 官方 [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache)（3 种落盘时机、64-token 单元、best-effort）+ Harness 五重强制 + Pi 映射
 
 ## 🛠️ 故障排查
 

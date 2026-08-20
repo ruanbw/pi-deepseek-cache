@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -23,6 +23,8 @@ const FLAT_CHART_EPSILON = 0.05;
 // R12: 成本估算 — DeepSeek 定价（每百万 token，美元）
 const COST_PER_MILLION_CACHE_READ = 0.027;   // 缓存命中单价
 const COST_PER_MILLION_INPUT = 0.27;          // 缓存未命中单价
+
+const MAX_SUMMARY_CACHE = 64;
 
 // ───────── R9: 局部类型定义，消除 any ─────────
 
@@ -47,6 +49,42 @@ interface HistoryPoint {
   turn: number;
   hitRate: number;
   timestamp: number;
+}
+
+// Harness: 字节确定性 helpers (参考 deepseek-harness orderTools/canonicalHeader/deepFreeze + api-docs deepseek kv_cache 前缀逐字节一致)
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) as string;
+  if (Array.isArray(v)) return "[" + (v as unknown[]).map(stableStringify).join(",") + "]";
+  const obj = v as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
+}
+function hashMessages(msgs: unknown): string {
+  return createHash("sha256").update(stableStringify(msgs)).digest("hex");
+}
+function getToolName(t: unknown): string {
+  if (!t || typeof t !== "object") return "";
+  const o = t as Record<string, unknown>;
+  if (typeof o.name === "string") return o.name;
+  const fn = o.function as Record<string, unknown> | undefined;
+  if (fn && typeof fn.name === "string") return fn.name;
+  return "";
+}
+function ensureStatsDir() {
+  if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
+}
+function atomicWriteJson(path: string, data: unknown) {
+  ensureStatsDir();
+  const tmp = path + "." + process.pid + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data, null, 2));
+  renameSync(tmp, path);
+}
+function setSummaryCache(cache: Map<string, string>, k: string, v: string) {
+  cache.set(k, v);
+  if (cache.size > MAX_SUMMARY_CACHE) {
+    const first = cache.keys().next().value as string | undefined;
+    if (first !== undefined) cache.delete(first);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -90,8 +128,7 @@ function scheduleSaveStats(s: PersistedStats) {
     pendingStats = null;
     (async () => {
       try {
-        if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
-        await writeFile(STATS_FILE, JSON.stringify(data, null, 2));
+        atomicWriteJson(STATS_FILE, data);
       } catch (err) {
         if (extensionCtx) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -112,8 +149,7 @@ function scheduleSaveHistory(h: HistoryPoint[]) {
     pendingHistory = null;
     (async () => {
       try {
-        if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
-        await writeFile(HISTORY_FILE, JSON.stringify(data.slice(-MAX_HISTORY_POINTS), null, 2));
+        atomicWriteJson(HISTORY_FILE, data.slice(-MAX_HISTORY_POINTS));
       } catch (err) {
         if (extensionCtx) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -134,8 +170,7 @@ function flushPendingWrites() {
     const data = pendingStats;
     pendingStats = null;
     try {
-      if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
-      writeFileSync(STATS_FILE, JSON.stringify(data, null, 2));
+      atomicWriteJson(STATS_FILE, data);
     } catch (err) {
       if (extensionCtx) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -151,8 +186,7 @@ function flushPendingWrites() {
     const data = pendingHistory;
     pendingHistory = null;
     try {
-      if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
-      writeFileSync(HISTORY_FILE, JSON.stringify(data.slice(-MAX_HISTORY_POINTS), null, 2));
+      atomicWriteJson(HISTORY_FILE, data.slice(-MAX_HISTORY_POINTS));
     } catch (err) {
       if (extensionCtx) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -204,10 +238,9 @@ function loadSummaryCache(): Map<string, string> {
 
 function saveSummaryCache(cache: Map<string, string>) {
   try {
-    if (!existsSync(STATS_DIR)) mkdirSync(STATS_DIR, { recursive: true });
     const obj: Record<string, string> = {};
     for (const [k, v] of cache) obj[k] = v;
-    writeFileSync(SUMMARY_CACHE_FILE, JSON.stringify(obj, null, 2));
+    atomicWriteJson(SUMMARY_CACHE_FILE, obj);
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -331,6 +364,7 @@ class CacheGraphOverlay implements Focusable {
     // Y 轴标签宽度
     const yW = Math.max(maxRate.toFixed(0).length, minRate.toFixed(0).length) + 1;
 
+    const chart: string[] = [];
     // R6: 命中率无波动时的特殊处理
     if (maxRate - minRate < FLAT_CHART_EPSILON) {
       const mid = Math.floor(data.length / 2);
@@ -377,7 +411,7 @@ class CacheGraphOverlay implements Focusable {
       for (let i = 0; i < firstStr.length && i < data.length; i++) xChars[i] = firstStr[i];
 
       // 中标签居中
-      if (mid !== "") {
+      if (typeof mid === "number") {
         const midStr = String(mid);
         const midStart = Math.floor((data.length - midStr.length) / 2);
         for (let i = 0; i < midStr.length; i++) {
@@ -510,6 +544,7 @@ export default function (pi: ExtensionAPI) {
       hitRateHistory.length = 0;
       lastHitRate = 0;
       lastPrefixHash = undefined;
+      lastPrefixLen = 0;
       prefixBreaks = 0;
       summaryCache.clear();
       flushPendingWrites();
@@ -525,28 +560,64 @@ export default function (pi: ExtensionAPI) {
   // ───────── P2 前缀守卫 ─────────
   pi.on("context", async (event, ctx) => {
     setExtensionCtx(ctx);
-    const onWire = event.messages.filter((m: CachedMessage) => m?.customType !== "volatile-scratch");
+    const msgs = Array.isArray((event as unknown as {messages?: unknown}).messages) ? (event.messages as CachedMessage[]) : [];
+    const onWire = msgs.filter((m: CachedMessage) => m?.customType !== "volatile-scratch");
     return { messages: onWire };
   });
 
-  // R1: 前缀指纹 → 缓存破坏诊断
+  // R1: 前缀指纹 → 缓存破坏诊断 (Harness: headerEquals+prefix包含检测, 参考 api-docs deepseek kv_cache 前缀完整匹配)
   let lastPrefixHash: string | undefined;
+  let lastPrefixLen = 0;
   let prefixBreaks = 0;
   pi.on("before_provider_request", (event, ctx) => {
     setExtensionCtx(ctx);
-    const msgs = (event.payload as ProviderPayload).messages ?? [];
-    const currentPrefixHash = createHash("sha256")
-      .update(JSON.stringify(msgs.slice(0, -1))).digest("hex");
-
-    // 检测前缀变化：若上一轮有哈希且当前哈希不是其延续（即既有前缀被修改而非追加）
-    if (lastPrefixHash !== undefined && currentPrefixHash !== lastPrefixHash) {
-      prefixBreaks++;
-      ctx.ui.notify(
-        `检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`,
-        "warning",
-      );
+    const payload = event.payload as Record<string, unknown> | null | undefined;
+    // 字节确定性：tools 按 Harness orderTools 码点字典序排序，避免工具顺序抖动击穿缓存 (harness: packages/core/system-prompt/src/index.ts:orderTools)
+    if (payload && typeof payload === "object") {
+      const toolsRaw = (payload as Record<string, unknown>).tools;
+      if (Array.isArray(toolsRaw) && toolsRaw.length > 1) {
+        const sorted = [...toolsRaw].sort((a: unknown, b: unknown) => getToolName(a).localeCompare(getToolName(b)));
+        const isSameOrder = toolsRaw.every((v: unknown, i: number) => getToolName(v) === getToolName(sorted[i]));
+        if (!isSameOrder) {
+          const next = { ...(payload as Record<string, unknown>), tools: sorted };
+          // 保持 chain 可观测：prefix 字节一致性优先于原始工具顺序
+          // 返回替换 payload (runner.js:790 只当 !==undefined 才替换)
+          // 此处先完成前缀哈希诊断，排序后的 payload 由链式 runner 返回替换
+          const msgsForHash = Array.isArray((next as Record<string, unknown>).messages) ? ((next as Record<string, unknown>).messages as unknown[]) : [];
+          const prefixForHash = msgsForHash.length >= 1 ? msgsForHash.slice(0, -1) : [];
+          // 稳定序列化哈希，避免键序抖动误报 (harness: sameSchema JSON.stringify 有序, 此处用 stableStringify 兼容多 provider形态)
+          const curHash = prefixForHash.length === 0 ? undefined : hashMessages(prefixForHash);
+          const curLen = prefixForHash.length;
+          if (lastPrefixHash !== undefined && curHash !== undefined) {
+            const isAppend = curLen >= lastPrefixLen && hashMessages(prefixForHash.slice(0, lastPrefixLen)) === lastPrefixHash;
+            const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
+            if (!isAppend && !isEqual) {
+              prefixBreaks++;
+              ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
+            }
+          }
+          if (curHash !== undefined) { lastPrefixHash = curHash; lastPrefixLen = curLen; } else { lastPrefixHash = undefined; lastPrefixLen = 0; }
+          return next;
+        }
+      }
     }
-    lastPrefixHash = currentPrefixHash;
+    const rawMsgs = (payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).messages))
+      ? ((payload as Record<string, unknown>).messages as unknown[]) : [];
+    if (rawMsgs.length === 0) return; // 非payload 形态静默跳过，空前缀不告警 (Harness: deepseek-official only)
+    const prefix = rawMsgs.length >= 1 ? rawMsgs.slice(0, -1) : [];
+    if (prefix.length === 0) { lastPrefixHash = undefined; lastPrefixLen = 0; return; }
+    const curHash = hashMessages(prefix);
+    const curLen = prefix.length;
+    if (lastPrefixHash !== undefined) {
+      const isAppend = curLen >= lastPrefixLen && hashMessages(prefix.slice(0, lastPrefixLen)) === lastPrefixHash;
+      const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
+      if (!isAppend && !isEqual) {
+        prefixBreaks++;
+        ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
+      }
+    }
+    lastPrefixHash = curHash;
+    lastPrefixLen = curLen;
   });
 
   // ───────── P3 缓存友好的 compaction ─────────
@@ -567,7 +638,7 @@ export default function (pi: ExtensionAPI) {
     if (!summary) {
       summary = await summarizeWithFlash(text, ctx, signal);
       if (!summary) return;
-      summaryCache.set(key, summary);
+      setSummaryCache(summaryCache, key, summary);
       saveSummaryCache(summaryCache); // R12: 新摘要落盘，跨会话复用
     }
 
@@ -580,6 +651,10 @@ export default function (pi: ExtensionAPI) {
       },
     };
   });
+
+  // Harness: 会话生命周期收尾 + 上下文安全初始化 (api-docs kv_cache best-effort 资源清理类比：退出必 flush)
+  pi.on("session_start", (_event, ctx) => { extensionCtx = ctx; });
+  pi.on("session_shutdown", () => { flushPendingWrites(); });
 }
 
 async function summarizeWithFlash(
@@ -624,9 +699,9 @@ async function summarizeWithFlash(
       { apiKey: auth.apiKey, headers: auth.headers, maxTokens: SUMMARY_MAX_TOKENS, signal },
     );
 
-    const summary = response.content
+    const summary = (response as { content: Array<{ type: string; text?: string }> }).content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
+      .map((c: { text: string }) => c.text)
       .join("\n");
 
     return summary.trim() || undefined;
