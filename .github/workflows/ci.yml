@@ -19,6 +19,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Audit (moderate+)
+        run: npm audit --audit-level=moderate
+
       - name: Lint
         run: npm run lint
 
