@@ -18,7 +18,7 @@ Stable prompt prefixes · higher cache-hit rates · live cache stats — so long
 
 ## ✨ Why this exists
 
-DeepSeek's API has **Context Caching on Disk** built in: any request whose prompt **prefix** exactly matches a previous one is billed at the much cheaper *cache-hit* rate (often ~90% off). The catch — cache hits only happen when your prompt prefixes stay **byte-for-byte stable**.
+DeepSeek's API has **Context Caching on Disk** built in: any request whose prompt **prefix** fully matches a previously persisted cache prefix unit is billed at the much cheaper *cache-hit* rate (often ~90% off). The catch — your prompt prefixes must stay **stable across turns**, token-for-token.
 
 In long agent sessions that's surprisingly hard:
 
@@ -31,7 +31,7 @@ In long agent sessions that's surprisingly hard:
 
 ## 🎯 Features
 
-- **Prefix Guard** — strips `volatile-scratch` messages from the context to keep the byte prefix stable across turns
+- **Prefix Guard** — strips `volatile-scratch` messages from the context to keep the prompt prefix stable across turns
 - **Stable Tool Ordering** — lexicographically sorts `tools` in `before_provider_request` (Harness `orderTools` parity) so tool-list order jitter never breaks the cache
 - **Cache Break Diagnostics** — prefix-inclusion detection (stable-JSON + SHA-256) warns only when an existing prefix is rewritten, not on normal append; empty/unknown payloads are silently skipped
 - **Hit Rate Telemetry** — accumulates `cacheRead` / `input` / `cacheWrite` / `turns` from every response and persists to disk

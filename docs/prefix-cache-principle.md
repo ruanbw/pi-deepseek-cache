@@ -402,14 +402,18 @@ pi.on("context", async (event, ctx) => {
 #### before_provider_request — 发送前一致性门
 
 ```ts
-// index.ts:570 — 节选
+// index.ts:573 — 节选
 pi.on("before_provider_request", (event, ctx) => {
   const payload = event.payload as Record<string, unknown>;
   if (Array.isArray(payload.tools) && payload.tools.length > 1) {
-    const sorted = [...payload.tools].sort((a,b) => getToolName(a).localeCompare(getToolName(b)));
-    if (!isSameOrder) return { ...payload, tools: sorted }; // 覆盖工具顺序
+    // 码点字典序排序（localeCompare 依赖 ICU/locale，跨环境可能不同序）
+    const sorted = [...payload.tools].sort((a, b) => {
+      const na = getToolName(a), nb = getToolName(b);
+      return na < nb ? -1 : na > nb ? 1 : 0;
+    });
+    return { ...payload, tools: sorted }; // 覆盖工具顺序（已排序时内容等价）
   }
-  // 对 messages.slice(0, -1) 做 SHA-256，检测非追加式前缀变化
+  // 对完整 messages 列表（含最后一条）做 SHA-256，检测非追加式前缀变化
 });
 ```
 
@@ -439,17 +443,15 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 ### 7.2 本项目新增的三个强制点
 
-#### 1. 工具排序强制（Tool Ordering Enforcement）
-
 - **问题**：Pi 侧不同扩展注册工具的顺序不确定；若直接透传，wire 字节在 tools 段即分叉。
-- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅当顺序不同时返回新 payload 覆盖原序（index.ts:576）。
-- **与 Harness 一致性**：与 dsh-system-prompt/lib/index.js:44 orderTools 的回退分支语义一致（未配置 toolOrder 时按 compareToolNames 排序）；差异在于 Pi 侧以 localeCompare 实现，对 ASCII 工具名等价于码点比较。
+- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:580）。
+- **与 Harness 一致性**：与 dsh-system-prompt/lib/index.js:44 orderTools 的回退分支语义一致（未配置 toolOrder 时按 compareToolNames 排序）；Pi 侧同样使用码点比较（localeCompare 依赖 ICU/locale，跨环境可能不同序，已弃用）。
 - **可观测**：排序覆盖会连带触发前缀哈希的重新计算，保证诊断基于归一化后的字节。
 
 #### 2. 前缀包含检测（Prefix Containment Check）
 
 - **问题**：官方要求完整匹配已持久化的 cache prefix unit，但开发期更关心本轮请求是否仍是上一轮的追加——非追加即可能 miss。
-- **做法**：对 messages.slice(0, -1)（排除本轮新增的最后一条 user）做 stableStringify 到 SHA-256，记录 lastPrefixHash / lastPrefixLen；每轮比较 hash(prefix.slice(0, lastLen)) === lastHash 判断是否为追加，否则 prefixBreaks++ 并 ctx.ui.notify 告警（index.ts:586）。
+- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）做 stableStringify 到 SHA-256，记录 lastPrefixHash / lastPrefixLen；每轮比较 hash(prefix.slice(0, lastLen)) === lastHash 判断是否为追加，否则 prefixBreaks++ 并 ctx.ui.notify 告警（index.ts:591、index.ts:610）。
 - **与 Harness 一致性**：Harness 以 foldRequestHeader + headerEquals 判断 envelope 是否变化，以 session.deriveMessages() 重建历史；本项目在 wire 侧以哈希等价实现前缀包含检测，二者互补——前者保 envelope，后者保 messages 前缀的追加性。
 - **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:55）。
 

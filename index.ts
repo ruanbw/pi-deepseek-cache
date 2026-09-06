@@ -588,7 +588,7 @@ export default function (pi: ExtensionAPI) {
         // 返回替换 payload (runner.js:790 只当 !==undefined 才替换)
         // 此处先完成前缀哈希诊断，排序后的 payload 由链式 runner 返回替换
         const msgsForHash = Array.isArray((next as Record<string, unknown>).messages) ? ((next as Record<string, unknown>).messages as unknown[]) : [];
-        const prefixForHash = msgsForHash.length >= 1 ? msgsForHash.slice(0, -1) : [];
+        const prefixForHash = msgsForHash; // 完整消息列表（含最后一条），对齐官方 cache unit 边界（用户输入末尾落盘）
         // 稳定序列化哈希，避免键序抖动误报 (harness: sameSchema JSON.stringify 有序, 此处用 stableStringify 兼容多 provider形态)
         const curHash = prefixForHash.length === 0 ? undefined : hashMessages(prefixForHash);
         const curLen = prefixForHash.length;
@@ -607,8 +607,7 @@ export default function (pi: ExtensionAPI) {
     const rawMsgs = (payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).messages))
       ? ((payload as Record<string, unknown>).messages as unknown[]) : [];
     if (rawMsgs.length === 0) return; // 非payload 形态静默跳过，空前缀不告警 (Harness: deepseek-official only)
-    const prefix = rawMsgs.length >= 1 ? rawMsgs.slice(0, -1) : [];
-    if (prefix.length === 0) { lastPrefixHash = undefined; lastPrefixLen = 0; return; }
+    const prefix = rawMsgs; // 完整消息列表（rawMsgs.length > 0 已由 609 行保证）
     const curHash = hashMessages(prefix);
     const curLen = prefix.length;
     if (lastPrefixHash !== undefined) {

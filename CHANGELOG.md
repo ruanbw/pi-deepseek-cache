@@ -1,5 +1,22 @@
 # pi-deepseek-cache 变更日志
 
+## Unreleased (2026-09-07): 前缀缓存适配修复（基于官方文档复查）
+
+### 修复
+
+- **工具排序确定性**：`before_provider_request` 的 `payload.tools` 排序由 `localeCompare` 改为码点比较（Harness `orderTools` parity）。`localeCompare` 依赖 ICU/locale，跨机器/跨 locale 可能给出不同顺序，正是要消除的抖动来源；排序始终生效（已排序时替换内容等价）。
+- **跨会话误报**：`session_start` / `session_before_switch` 时重置 `lastPrefixHash` / `lastPrefixLen`，切换/新建会话不再把旧会话残留哈希与新会话前缀比对而误报"缓存前缀变化"。（安装的 `@earendil-works/pi-coding-agent` 类型无 `session_switch` 事件，改用可取消的 `session_before_switch`。）
+- **成本估算过时**：单价由 0.027/0.27 更新为当前 `deepseek-v4-flash` 峰值价（cache hit $0.014/M、miss $0.44/M；谷值减半，01:00-04:00 / 06:00-10:00 UTC 周一至五），节省额不再被低估约 40%。
+
+### 优化
+
+- **前缀哈希边界对齐官方 cache unit**：诊断哈希由 `messages.slice(0, -1)` 改为完整消息列表（官方规则：cache prefix unit 在用户输入末尾落盘），最后一条消息的改写不再漏诊；追加式增长（官方 Example 1 语义）仍不打扰。
+- **README 措辞校准**：`README.md` / `README.zh.md` 的 "byte-for-byte / 逐字节稳定" 弱化为 "跨轮次稳定、逐 token 一致"，与官方 "fully match a cache prefix unit" 表述对齐（诊断哈希是 wire 字节的规范化代理，非字节本身）。
+
+### 验证
+
+- `npx tsc --noEmit`：4 处既有 SDK 形态不一致（行 1/515/528/562，HEAD 相同），未新增；`npx vitest run`：28 tests passed；`npm run lint`：32 problems 与 HEAD 相同，未新增。
+
 ## v0.2.0 (2026-08-20): Harness 对齐的前缀缓存强制 + 原子持久化
 
 > 本版本以官方 [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache) 与 DeepSeek Harness 五重强制为 Ground Truth，重构前缀缓存命中路径。新增 `docs/prefix-cache-principle.md`（507 行）沉淀官方三种落盘时机 / 两示例 / 计费字段 / best-effort 与 Harness 谱系。
