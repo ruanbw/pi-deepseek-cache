@@ -41,7 +41,7 @@
     "eslint": "^10.8.1",
     "prettier": "^3.9.6",
     "typescript-eslint": "^8.67.0",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   },
   "pi": {
     "extensions": [
