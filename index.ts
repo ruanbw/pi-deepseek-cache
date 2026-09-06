@@ -20,9 +20,10 @@ const MAX_HISTORY_POINTS = 100;
 const SUMMARY_MAX_TOKENS = 8192;
 const FLAT_CHART_EPSILON = 0.05;
 
-// R12: 成本估算 — DeepSeek 定价（每百万 token，美元）
-const COST_PER_MILLION_CACHE_READ = 0.027;   // 缓存命中单价
-const COST_PER_MILLION_INPUT = 0.27;          // 缓存未命中单价
+// R12: 成本估算 — DeepSeek 定价（每百万 token，美元，deepseek-v4-flash 峰值价）
+// 峰值时段：01:00-04:00 / 06:00-10:00 UTC 周一至五；谷值减半（见 api-docs /quick_start/pricing）
+const COST_PER_MILLION_CACHE_READ = 0.014;   // 缓存命中单价（peak）
+const COST_PER_MILLION_INPUT = 0.44;         // 缓存未命中单价（peak）
 
 const MAX_SUMMARY_CACHE = 64;
 
@@ -576,29 +577,31 @@ export default function (pi: ExtensionAPI) {
     if (payload && typeof payload === "object") {
       const toolsRaw = (payload as Record<string, unknown>).tools;
       if (Array.isArray(toolsRaw) && toolsRaw.length > 1) {
-        const sorted = [...toolsRaw].sort((a: unknown, b: unknown) => getToolName(a).localeCompare(getToolName(b)));
-        const isSameOrder = toolsRaw.every((v: unknown, i: number) => getToolName(v) === getToolName(sorted[i]));
-        if (!isSameOrder) {
-          const next = { ...(payload as Record<string, unknown>), tools: sorted };
-          // 保持 chain 可观测：prefix 字节一致性优先于原始工具顺序
-          // 返回替换 payload (runner.js:790 只当 !==undefined 才替换)
-          // 此处先完成前缀哈希诊断，排序后的 payload 由链式 runner 返回替换
-          const msgsForHash = Array.isArray((next as Record<string, unknown>).messages) ? ((next as Record<string, unknown>).messages as unknown[]) : [];
-          const prefixForHash = msgsForHash.length >= 1 ? msgsForHash.slice(0, -1) : [];
-          // 稳定序列化哈希，避免键序抖动误报 (harness: sameSchema JSON.stringify 有序, 此处用 stableStringify 兼容多 provider形态)
-          const curHash = prefixForHash.length === 0 ? undefined : hashMessages(prefixForHash);
-          const curLen = prefixForHash.length;
-          if (lastPrefixHash !== undefined && curHash !== undefined) {
-            const isAppend = curLen >= lastPrefixLen && hashMessages(prefixForHash.slice(0, lastPrefixLen)) === lastPrefixHash;
-            const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
-            if (!isAppend && !isEqual) {
-              prefixBreaks++;
-              ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
-            }
+        const sorted = [...toolsRaw].sort((a: unknown, b: unknown) => {
+          const na = getToolName(a);
+          const nb = getToolName(b);
+          // 码点字典序（Harness orderTools parity）：localeCompare 依赖 ICU/locale，跨环境可能给出不同顺序
+          return na < nb ? -1 : na > nb ? 1 : 0;
+        });
+        const next = { ...(payload as Record<string, unknown>), tools: sorted };
+        // 保持 chain 可观测：prefix 字节一致性优先于原始工具顺序
+        // 返回替换 payload (runner.js:790 只当 !==undefined 才替换)
+        // 此处先完成前缀哈希诊断，排序后的 payload 由链式 runner 返回替换
+        const msgsForHash = Array.isArray((next as Record<string, unknown>).messages) ? ((next as Record<string, unknown>).messages as unknown[]) : [];
+        const prefixForHash = msgsForHash.length >= 1 ? msgsForHash.slice(0, -1) : [];
+        // 稳定序列化哈希，避免键序抖动误报 (harness: sameSchema JSON.stringify 有序, 此处用 stableStringify 兼容多 provider形态)
+        const curHash = prefixForHash.length === 0 ? undefined : hashMessages(prefixForHash);
+        const curLen = prefixForHash.length;
+        if (lastPrefixHash !== undefined && curHash !== undefined) {
+          const isAppend = curLen >= lastPrefixLen && hashMessages(prefixForHash.slice(0, lastPrefixLen)) === lastPrefixHash;
+          const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
+          if (!isAppend && !isEqual) {
+            prefixBreaks++;
+            ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
           }
-          if (curHash !== undefined) { lastPrefixHash = curHash; lastPrefixLen = curLen; } else { lastPrefixHash = undefined; lastPrefixLen = 0; }
-          return next;
         }
+        if (curHash !== undefined) { lastPrefixHash = curHash; lastPrefixLen = curLen; } else { lastPrefixHash = undefined; lastPrefixLen = 0; }
+        return next;
       }
     }
     const rawMsgs = (payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).messages))
@@ -652,8 +655,11 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // Harness: 会话生命周期收尾 + 上下文安全初始化 (api-docs kv_cache best-effort 资源清理类比：退出必 flush)
-  pi.on("session_start", (_event, ctx) => { extensionCtx = ctx; });
+  // 会话生命周期：切换/新会话时重置前缀指纹，避免旧会话哈希残留导致跨会话假阳性告警；
+  // 退出时强制 flush（api-docs kv_cache best-effort 资源清理类比）
+  const resetPrefixFingerprint = () => { lastPrefixHash = undefined; lastPrefixLen = 0; };
+  pi.on("session_start", (_event, ctx) => { extensionCtx = ctx; resetPrefixFingerprint(); });
+  pi.on("session_before_switch", () => { resetPrefixFingerprint(); });
   pi.on("session_shutdown", () => { flushPendingWrites(); });
 }
 
