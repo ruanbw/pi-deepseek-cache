@@ -27,6 +27,104 @@ const COST_PER_MILLION_INPUT = 0.44;         // 缓存未命中单价（peak）
 
 const MAX_SUMMARY_CACHE = 64;
 
+type Language = "en" | "zh";
+
+const STRINGS = {
+  en: {
+    statsParseFailed: (message: string) =>
+      `[deepseek-cache] Failed to parse stats.json (${message}); reset`,
+    statsWriteFailed: (message: string) =>
+      `[deepseek-cache] Failed to write stats.json: ${message}`,
+    statsFlushFailed: (message: string) =>
+      `[deepseek-cache] Failed to flush stats.json: ${message}`,
+    historyParseFailed: (message: string) =>
+      `[deepseek-cache] Failed to parse history.json (${message}); reset`,
+    historyWriteFailed: (message: string) =>
+      `[deepseek-cache] Failed to write history.json: ${message}`,
+    historyFlushFailed: (message: string) =>
+      `[deepseek-cache] Failed to flush history.json: ${message}`,
+    summaryCacheParseFailed: (message: string) =>
+      `[deepseek-cache] Failed to parse summary-cache.json (${message}); reset`,
+    summaryCacheWriteFailed: (message: string) =>
+      `[deepseek-cache] Failed to write summary-cache.json: ${message}`,
+    statsTitle: "⚡ DeepSeek Cache Statistics",
+    hitRate: "Hit rate",
+    cacheHits: "Cache hits",
+    cacheMisses: "Cache misses",
+    cacheWrites: "Cache writes",
+    turns: "Turns",
+    estimatedSavings: "Estimated savings",
+    close: "Esc Close",
+    graphTitle: "⚡ Cache Hit Rate Trend",
+    graphTitleWithPoints: (count: number) => `⚡ Cache Hit Rate Trend (${count} data points)`,
+    noData: "No hit-rate data yet",
+    keepChatting: "Continue for a few turns first",
+    statsDescription: "DeepSeek prefix cache hit rate",
+    graphDescription: "DeepSeek cache hit-rate trend",
+    resetDescription: "Reset DeepSeek cache statistics",
+    resetDone: "Cache statistics reset",
+    prefixChanged: (count: number) =>
+      `Cache prefix changed (#${count}); this turn may miss the cache`,
+    previousSummary: "Previous summary",
+    newHistory: "New history",
+    modelMissing: "deepseek-v4-flash was not found; falling back to default compaction",
+    authFailed: "deepseek-v4-flash authentication failed; falling back to default compaction",
+    summaryFailed: (message: string) =>
+      `Flash summary failed: ${message}; falling back to default compaction`,
+    summaryPrompt:
+      "Compress the following conversation history into a structured Markdown summary covering: " +
+      "goals, key decisions and rationale, code/file changes, current progress, blockers and unresolved questions, and next steps. " +
+      "Write the summary in the dominant language of the conversation. Be complete because this summary will replace the original history.\n\n",
+  },
+  zh: {
+    statsParseFailed: (message: string) =>
+      `[deepseek-cache] stats.json 解析失败 (${message}),已重置`,
+    statsWriteFailed: (message: string) => `[deepseek-cache] stats.json 写入失败: ${message}`,
+    statsFlushFailed: (message: string) => `[deepseek-cache] stats.json flush 失败: ${message}`,
+    historyParseFailed: (message: string) =>
+      `[deepseek-cache] history.json 解析失败 (${message}),已重置`,
+    historyWriteFailed: (message: string) => `[deepseek-cache] history.json 写入失败: ${message}`,
+    historyFlushFailed: (message: string) => `[deepseek-cache] history.json flush 失败: ${message}`,
+    summaryCacheParseFailed: (message: string) =>
+      `[deepseek-cache] summary-cache.json 解析失败 (${message}),已重置`,
+    summaryCacheWriteFailed: (message: string) =>
+      `[deepseek-cache] summary-cache.json 写入失败: ${message}`,
+    statsTitle: "⚡ DeepSeek 缓存统计",
+    hitRate: "命中率",
+    cacheHits: "缓存命中",
+    cacheMisses: "缓存未命中",
+    cacheWrites: "缓存写入",
+    turns: "对话轮次",
+    estimatedSavings: "预估节省",
+    close: "Esc 关闭",
+    graphTitle: "⚡ 缓存命中率趋势",
+    graphTitleWithPoints: (count: number) => `⚡ 缓存命中率趋势 (${count} 个数据点)`,
+    noData: "暂无命中率数据",
+    keepChatting: "请先进行多轮对话",
+    statsDescription: "DeepSeek 前缀缓存命中率",
+    graphDescription: "DeepSeek 缓存命中率趋势图",
+    resetDescription: "重置 DeepSeek 缓存统计数据",
+    resetDone: "缓存统计已重置",
+    prefixChanged: (count: number) => `检测到缓存前缀变化（第 ${count} 次），本轮可能未命中缓存`,
+    previousSummary: "上次摘要",
+    newHistory: "新增历史",
+    modelMissing: "找不到 deepseek-v4-flash,回退默认 compaction",
+    authFailed: "flash 摘要鉴权失败,回退默认 compaction",
+    summaryFailed: (message: string) => `flash 摘要失败:${message},回退默认 compaction`,
+    summaryPrompt:
+      "把下面这段对话历史压缩成结构化 markdown 摘要,覆盖:" +
+      "①目标 ②关键决策与理由 ③代码/文件改动 ④当前进度 ⑤堵塞与未决问题 ⑥后续步骤。" +
+      "务必完整,因为它将替换这段历史。\n\n",
+  },
+} as const;
+
+export function resolveLanguage(env: NodeJS.ProcessEnv = process.env): Language {
+  const locale = env.PI_DEEPSEEK_CACHE_LANG ?? env.LC_ALL ?? env.LC_MESSAGES ?? env.LANG ?? "";
+  return locale.toLowerCase().startsWith("zh") ? "zh" : "en";
+}
+
+const strings = STRINGS[resolveLanguage()];
+
 // ───────── R9: 局部类型定义，消除 any ─────────
 
 interface CachedMessage {
@@ -106,7 +204,7 @@ function loadStats(): PersistedStats {
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] stats.json 解析失败 (${msg}),已重置`, "warning");
+      extensionCtx.ui.notify(strings.statsParseFailed(msg), "warning");
     }
   }
   return { cacheRead: 0, input: 0, cacheWrite: 0, turns: 0 };
@@ -133,7 +231,7 @@ function scheduleSaveStats(s: PersistedStats) {
       } catch (err) {
         if (extensionCtx) {
           const msg = err instanceof Error ? err.message : String(err);
-          extensionCtx.ui.notify(`[deepseek-cache] stats.json 写入失败: ${msg}`, "error");
+          extensionCtx.ui.notify(strings.statsWriteFailed(msg), "error");
         }
       }
     })();
@@ -154,7 +252,7 @@ function scheduleSaveHistory(h: HistoryPoint[]) {
       } catch (err) {
         if (extensionCtx) {
           const msg = err instanceof Error ? err.message : String(err);
-          extensionCtx.ui.notify(`[deepseek-cache] history.json 写入失败: ${msg}`, "error");
+          extensionCtx.ui.notify(strings.historyWriteFailed(msg), "error");
         }
       }
     })();
@@ -175,7 +273,7 @@ function flushPendingWrites() {
     } catch (err) {
       if (extensionCtx) {
         const msg = err instanceof Error ? err.message : String(err);
-        extensionCtx.ui.notify(`[deepseek-cache] stats.json flush 失败: ${msg}`, "error");
+        extensionCtx.ui.notify(strings.statsFlushFailed(msg), "error");
       }
     }
   }
@@ -191,7 +289,7 @@ function flushPendingWrites() {
     } catch (err) {
       if (extensionCtx) {
         const msg = err instanceof Error ? err.message : String(err);
-        extensionCtx.ui.notify(`[deepseek-cache] history.json flush 失败: ${msg}`, "error");
+        extensionCtx.ui.notify(strings.historyFlushFailed(msg), "error");
       }
     }
   }
@@ -203,7 +301,7 @@ function loadHistory(): HistoryPoint[] {
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] history.json 解析失败 (${msg}),已重置`, "warning");
+      extensionCtx.ui.notify(strings.historyParseFailed(msg), "warning");
     }
   }
   return [];
@@ -216,7 +314,7 @@ function saveHistory(h: Array<{ turn: number; hitRate: number; timestamp: number
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] history.json 写入失败: ${msg}`, "error");
+      extensionCtx.ui.notify(strings.historyWriteFailed(msg), "error");
     }
   }
 }
@@ -231,7 +329,7 @@ function loadSummaryCache(): Map<string, string> {
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] summary-cache.json 解析失败 (${msg}),已重置`, "warning");
+      extensionCtx.ui.notify(strings.summaryCacheParseFailed(msg), "warning");
     }
   }
   return new Map();
@@ -245,7 +343,7 @@ function saveSummaryCache(cache: Map<string, string>) {
   } catch (err) {
     if (extensionCtx) {
       const msg = err instanceof Error ? err.message : String(err);
-      extensionCtx.ui.notify(`[deepseek-cache] summary-cache.json 写入失败: ${msg}`, "error");
+      extensionCtx.ui.notify(strings.summaryCacheWriteFailed(msg), "error");
     }
   }
 }
@@ -293,16 +391,16 @@ class CacheStatsOverlay implements Focusable {
 
     return [
       th.fg("border", `╭${"─".repeat(inner)}╮`),
-      row(` ${th.fg("accent", "⚡ DeepSeek 缓存统计")}`),
+      row(` ${th.fg("accent", strings.statsTitle)}`),
       row(""),
-      row(label("命中率", `${hitRate}%`)),
-      row(label("缓存命中", `${cacheRead.toLocaleString()} tokens`)),
-      row(label("缓存未命中", `${input.toLocaleString()} tokens`)),
-      row(label("缓存写入", `${cacheWrite.toLocaleString()} tokens`)),
-      row(label("对话轮次", `${turns}`)),
-      row(label("预估节省", `${th.fg("accent", savedStr)}`)),
+      row(label(strings.hitRate, `${hitRate}%`)),
+      row(label(strings.cacheHits, `${cacheRead.toLocaleString()} tokens`)),
+      row(label(strings.cacheMisses, `${input.toLocaleString()} tokens`)),
+      row(label(strings.cacheWrites, `${cacheWrite.toLocaleString()} tokens`)),
+      row(label(strings.turns, `${turns}`)),
+      row(label(strings.estimatedSavings, `${th.fg("accent", savedStr)}`)),
       row(""),
-      row(` ${th.fg("dim", "Esc 关闭")}`),
+      row(` ${th.fg("dim", strings.close)}`),
       th.fg("border", `╰${"─".repeat(inner)}╯`),
     ];
   }
@@ -342,12 +440,12 @@ class CacheGraphOverlay implements Focusable {
     if (this.history.length === 0) {
       return [
         th.fg("border", `╭${"─".repeat(inner)}╮`),
-        row(` ${th.fg("accent", "⚡ 缓存命中率趋势")}`),
+        row(` ${th.fg("accent", strings.graphTitle)}`),
         row(""),
-        row(`  ${th.fg("dim", "暂无命中率数据")}`),
-        row(`  ${th.fg("dim", "请先进行多轮对话")}`),
+        row(`  ${th.fg("dim", strings.noData)}`),
+        row(`  ${th.fg("dim", strings.keepChatting)}`),
         row(""),
-        row(` ${th.fg("dim", "Esc 关闭")}`),
+        row(` ${th.fg("dim", strings.close)}`),
         th.fg("border", `╰${"─".repeat(inner)}╯`),
       ];
     }
@@ -435,7 +533,7 @@ class CacheGraphOverlay implements Focusable {
     // 组装完整弹窗
     const lines = [
       th.fg("border", `╭${"─".repeat(inner)}╮`),
-      row(` ${th.fg("accent", `⚡ 缓存命中率趋势 (${this.history.length} 个数据点)`)}`),
+      row(` ${th.fg("accent", strings.graphTitleWithPoints(this.history.length))}`),
       row(""),
     ];
 
@@ -444,7 +542,7 @@ class CacheGraphOverlay implements Focusable {
     }
 
     lines.push(row(""));
-    lines.push(row(` ${th.fg("dim", "Esc 关闭")}`));
+    lines.push(row(` ${th.fg("dim", strings.close)}`));
     lines.push(th.fg("border", `╰${"─".repeat(inner)}╯`));
 
     return lines;
@@ -507,7 +605,7 @@ export default function (pi: ExtensionAPI) {
 
   // /cache-stats → overlay 弹窗
   pi.registerCommand("cache-stats", {
-    description: "DeepSeek 前缀缓存命中率",
+    description: strings.statsDescription,
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom(
@@ -520,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 
   // /cache-graph → overlay 弹窗
   pi.registerCommand("cache-graph", {
-    description: "DeepSeek 缓存命中率趋势图",
+    description: strings.graphDescription,
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom(
@@ -533,11 +631,11 @@ export default function (pi: ExtensionAPI) {
 
   // R12: /cache-reset → 清空统计数据与历史
   pi.registerCommand("cache-reset", {
-    description: "重置 DeepSeek 缓存统计数据",
+    description: strings.resetDescription,
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       // 二次确认
-      await ctx.ui.notify("缓存统计已重置", "info");
+      await ctx.ui.notify(strings.resetDone, "info");
       cacheRead = 0;
       input = 0;
       cacheWrite = 0;
@@ -597,7 +695,7 @@ export default function (pi: ExtensionAPI) {
           const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
           if (!isAppend && !isEqual) {
             prefixBreaks++;
-            ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
+            ctx.ui.notify(strings.prefixChanged(prefixBreaks), "warning");
           }
         }
         if (curHash !== undefined) { lastPrefixHash = curHash; lastPrefixLen = curLen; } else { lastPrefixHash = undefined; lastPrefixLen = 0; }
@@ -615,7 +713,7 @@ export default function (pi: ExtensionAPI) {
       const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
       if (!isAppend && !isEqual) {
         prefixBreaks++;
-        ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
+        ctx.ui.notify(strings.prefixChanged(prefixBreaks), "warning");
       }
     }
     lastPrefixHash = curHash;
@@ -632,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 
     const history = serializeConversation(convertToLlm(messagesToSummarize));
     const text = previousSummary
-      ? `【上次摘要】\n${previousSummary}\n\n【新增历史】\n${history}`
+      ? `${strings.previousSummary}\n${previousSummary}\n\n${strings.newHistory}\n${history}`
       : history;
 
     const key = createHash("sha256").update(text).digest("hex");
@@ -669,13 +767,13 @@ async function summarizeWithFlash(
 ): Promise<string | undefined> {
   const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
   if (!model) {
-    ctx.ui.notify("找不到 deepseek-v4-flash,回退默认 compaction", "warning");
+    ctx.ui.notify(strings.modelMissing, "warning");
     return;
   }
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
-    ctx.ui.notify("flash 摘要鉴权失败,回退默认 compaction", "warning");
+    ctx.ui.notify(strings.authFailed, "warning");
     return;
   }
 
@@ -690,9 +788,7 @@ async function summarizeWithFlash(
               {
                 type: "text" as const,
                 text:
-                  "把下面这段对话历史压缩成结构化 markdown 摘要,覆盖:" +
-                  "①目标 ②关键决策与理由 ③代码/文件改动 ④当前进度 ⑤堵塞与未决问题 ⑥后续步骤。" +
-                  "务必完整,因为它将替换这段历史。\n\n" +
+                  strings.summaryPrompt +
                   text,
               },
             ],
@@ -712,7 +808,7 @@ async function summarizeWithFlash(
     return summary.trim() || undefined;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    ctx.ui.notify(`flash 摘要失败:${msg},回退默认 compaction`, "error");
+    ctx.ui.notify(strings.summaryFailed(msg), "error");
     return;
   }
 }

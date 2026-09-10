@@ -17,7 +17,23 @@ vi.mock("@earendil-works/pi-ai", async (importOriginal) => {
 });
 
 const { complete } = await import("@earendil-works/pi-ai");
-import index from "../index.js";
+import index, { resolveLanguage } from "../index.js";
+
+describe("language selection", () => {
+  it("defaults to English for non-Chinese locales", () => {
+    expect(resolveLanguage({ LANG: "fr_FR.UTF-8" })).toBe("en");
+  });
+
+  it("uses Chinese for Chinese locales", () => {
+    expect(resolveLanguage({ LANG: "zh_CN.UTF-8" })).toBe("zh");
+  });
+
+  it("lets PI_DEEPSEEK_CACHE_LANG take precedence", () => {
+    expect(
+      resolveLanguage({ PI_DEEPSEEK_CACHE_LANG: "en", LANG: "zh_CN.UTF-8" }),
+    ).toBe("en");
+  });
+});
 
 function createMockExtensionAPI() {
   const listeners = new Map<string, Function[]>();
