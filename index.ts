@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 //  常量
 // ═══════════════════════════════════════════════════════════════════════════
 
-const STATS_OVERLAY_WIDTH = 56;
+const STATS_OVERLAY_WIDTH = 62;
 const GRAPH_OVERLAY_WIDTH = 60;
 const CHART_HEIGHT = 10;
 const CHART_MAX_WIDTH = 48;
@@ -20,12 +20,70 @@ const MAX_HISTORY_POINTS = 100;
 const SUMMARY_MAX_TOKENS = 8192;
 const FLAT_CHART_EPSILON = 0.05;
 
-// R12: 成本估算 — DeepSeek 定价（每百万 token，美元，deepseek-v4-flash 峰值价）
-// 峰值时段：01:00-04:00 / 06:00-10:00 UTC 周一至五；谷值减半（见 api-docs /quick_start/pricing）
-const COST_PER_MILLION_CACHE_READ = 0.014;   // 缓存命中单价（peak）
-const COST_PER_MILLION_INPUT = 0.44;         // 缓存未命中单价（peak）
+// ───────── R13: 定价（官方 Models & Pricing，每百万 token，美元）─────────
+// Ground Truth: https://api-docs.deepseek.com/quick_start/pricing
+// 峰值时段为 01:00-04:00 与 06:00-10:00 UTC、周一至五（官方注(2) 另排除中国公共假期），
+// 其余时段（含周末与全部节假日）为谷值，官方定义谷值 = 峰值 / 2。
+interface PriceTier {
+  /** 缓存命中输入单价 */
+  hit: number;
+  /** 缓存未命中输入单价 */
+  miss: number;
+}
+const FLASH_TIER: PriceTier = { hit: 0.006, miss: 0.3 };
+const DEEPSEEK_PRICING: Record<string, PriceTier> = {
+  // 官方当前名，模型版本 DeepSeek-V4.1-Flash。
+  "deepseek-flash": FLASH_TIER,
+  // 官方注(1)：legacy 名 deepseek-v4-flash 仍受理，但模型已退役，请求由
+  // DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
+  "deepseek-v4-flash": FLASH_TIER,
+  // v4-pro 暂时同价。官方公告：“Starting at 04:00 UTC on Sept 14, 2026, all
+  // deepseek-v4-pro requests will route to V4.1-Flash at V4.1-Flash rates.
+  // This will continue until V4.1-Pro launches.”
+  // https://www.deepseek.com/en/news/deepseek-v4-1-flash/
+  // 注意：/quick_start/pricing 仍展示 v4-pro 的历史价列（0.044 / 1.32），与该公告冲突。
+  // 本扩展统计的是实际结算价，故按公告口径取 Flash 价；V4.1-Pro 上线后需在此处单独加价。
+  "deepseek-v4-pro": FLASH_TIER,
+  // 官方已于 2026-07-24 停用 deepseek-chat / deepseek-reasoner（它们只是 v4-flash
+  // 的思考/非思考模式别名，从未是独立模型）；保留映射仅为旧会话或自建代理兜底。
+  "deepseek-chat": FLASH_TIER,
+  "deepseek-reasoner": FLASH_TIER,
+};
+/** 未知模型时的保守下界（flash 谷值），避免高估节省额 */
+const DEFAULT_PRICING: PriceTier = { hit: 0.003, miss: 0.15 };
+const PEAK_HOURS_UTC: ReadonlyArray<readonly [number, number]> = [
+  [1, 4],
+  [6, 10],
+];
+
+/** 官方注(2)：01:00-04:00 / 06:00-10:00 UTC，周一至五 */
+function isPeakWindow(now: Date): boolean {
+  const day = now.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const hour = now.getUTCHours();
+  return PEAK_HOURS_UTC.some(([start, end]) => hour >= start && hour < end);
+}
+
+function lookupPricing(model: string | undefined): PriceTier | undefined {
+  if (!model) return undefined;
+  const direct = DEEPSEEK_PRICING[model];
+  if (direct) return direct;
+  for (const [id, tier] of Object.entries(DEEPSEEK_PRICING)) {
+    // 容忍 wire model 带版本/日期后缀（如 deepseek-v4-flash-0813）
+    if (model.startsWith(id) || model.includes(id)) return tier;
+  }
+  return undefined;
+}
+
+/** 当前生效单价：按模型取价，再按 peak/off-peak 折半 */
+function currentPricing(model: string | undefined, now: Date): PriceTier {
+  const tier = lookupPricing(model) ?? DEFAULT_PRICING;
+  return isPeakWindow(now) ? tier : { hit: tier.hit / 2, miss: tier.miss / 2 };
+}
 
 const MAX_SUMMARY_CACHE = 64;
+/** 摘要器模型候选名：官方当前名 + legacy 名，任一命中即可 */
+const SUMMARIZER_CANDIDATES = ["deepseek-flash", "deepseek-v4-flash"];
 
 // ───────── R9: 局部类型定义，消除 any ─────────
 
@@ -50,6 +108,30 @@ interface HistoryPoint {
   turn: number;
   hitRate: number;
   timestamp: number;
+}
+
+/** /cache-stats 渲染所需的完整视图（统计 + 单轮 + 计价上下文） */
+interface StatsView {
+  stats: PersistedStats;
+  /** 最近一轮的命中率；尚无 assistant 消息时为 undefined */
+  lastTurnHitRate: number | undefined;
+  /** 当前生效的 wire model，用于选价并显示 */
+  model: string | undefined;
+  pricing: PriceTier;
+  peak: boolean;
+  /** 官方 usage 只有 hit/miss，不提供 cache write；仅在确实观测到非零写入时才展示该行 */
+  reportsCacheWrite: boolean;
+}
+
+/**
+ * 前缀指纹。官方要求 system + tools + messages 整体完整匹配某个已落盘的
+ * cache prefix unit。pi-ai 把 system 并入 messages（openai-completions buildParams），
+ * 但 tools 是独立顶层字段，因此必须单独纳入指纹，否则工具增删/改 schema 会静默击穿缓存。
+ */
+interface PrefixFingerprint {
+  tools: string;
+  messages: string;
+  len: number;
 }
 
 // Harness: 字节确定性 helpers (参考 deepseek-harness orderTools/canonicalHeader/deepFreeze + api-docs deepseek kv_cache 前缀逐字节一致)
@@ -259,13 +341,13 @@ class CacheStatsOverlay implements Focusable {
   readonly width = STATS_OVERLAY_WIDTH;
   focused = false;
 
-  private stats: PersistedStats;
+  private view: StatsView;
   private theme: Theme;
   private done: () => void;
 
-  constructor(theme: Theme, stats: PersistedStats, done: () => void) {
+  constructor(theme: Theme, view: StatsView, done: () => void) {
     this.theme = theme;
-    this.stats = stats;
+    this.view = view;
     this.done = done;
   }
 
@@ -276,35 +358,54 @@ class CacheStatsOverlay implements Focusable {
   }
 
   render(_width: number): string[] {
-    const { cacheRead, input, cacheWrite, turns } = this.stats;
-    const denom = cacheRead + input;
-    const hitRate = denom ? ((cacheRead / denom) * 100).toFixed(1) : "0.0";
+    const { stats, lastTurnHitRate, model, pricing, peak, reportsCacheWrite } = this.view;
+    const { cacheRead, input, cacheWrite, turns } = stats;
     const th = this.theme;
     const w = this.width;
     const inner = w - 2;
 
-    // R12: 成本节省估算 — 缓存命中 vs 未命中的差价
-    const savedDollars = (cacheRead / 1_000_000) * (COST_PER_MILLION_INPUT - COST_PER_MILLION_CACHE_READ);
-    const savedStr = savedDollars >= 0.01 ? `$${savedDollars.toFixed(2)}` : "< $0.01";
+    // 官方口径 prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens；
+    // pi-ai 的 usage.input 已是不相交的 miss 部分，故 hit/(hit+miss) 即命中率。
+    // 此处为跨轮累计值（官方按请求逐次统计），另单独展示本轮值。
+    const cumulative = cacheRead + input ? (cacheRead / (cacheRead + input)) * 100 : 0;
+    // 节省额 = 命中部分相对全量 miss 的边际差价，按当前模型 + 当前时段计价
+    // flash 档单价低（谷值 hit $0.003 / miss $0.15），每百万命中仅省 $0.147，
+    // 固定 2 位小数会丢失有效信息，故小额用 4 位、大额用 2 位
+    const savedDollars = (cacheRead / 1_000_000) * (pricing.miss - pricing.hit);
+    const savedStr = savedDollars >= 0.01
+      ? `$${savedDollars.toFixed(savedDollars < 1 ? 4 : 2)}`
+      : "< $0.01";
 
     const pad = (s: string) => s + " ".repeat(Math.max(0, inner - visibleWidth(s)));
     const row = (s: string) => th.fg("border", "│") + pad(s) + th.fg("border", "│");
-    const label = (k: string, v: string) => `  ${th.fg("dim", k.padEnd(16))}${th.fg("accent", v)}`;
+    // 按显示宽度而非码元数补齐，避免 CJK 标签错位
+    const label = (k: string, v: string) => {
+      const key = k + " ".repeat(Math.max(0, 14 - visibleWidth(k)));
+      return `  ${th.fg("dim", key)}${th.fg("accent", v)}`;
+    };
 
-    return [
+    const lines = [
       th.fg("border", `╭${"─".repeat(inner)}╮`),
       row(` ${th.fg("accent", "⚡ DeepSeek 缓存统计")}`),
       row(""),
-      row(label("命中率", `${hitRate}%`)),
+      row(label("累计命中率", `${cumulative.toFixed(1)}%`)),
+      row(label("本轮命中率", lastTurnHitRate === undefined ? "—" : `${lastTurnHitRate.toFixed(1)}%`)),
       row(label("缓存命中", `${cacheRead.toLocaleString()} tokens`)),
       row(label("缓存未命中", `${input.toLocaleString()} tokens`)),
-      row(label("缓存写入", `${cacheWrite.toLocaleString()} tokens`)),
+    ];
+    // 官方 usage 仅提供 hit/miss，无 cache write 字段；未观测到写入时隐藏该行
+    if (reportsCacheWrite) lines.push(row(label("缓存写入", `${cacheWrite.toLocaleString()} tokens`)));
+    lines.push(
       row(label("对话轮次", `${turns}`)),
-      row(label("预估节省", `${th.fg("accent", savedStr)}`)),
+      row(label("预估节省", savedStr)),
+      row(""),
+      row(` ${th.fg("dim", `计价 ${model ?? "未知模型"} · ${peak ? "峰值" : "谷值"}时段`)}`),
+      row(` ${th.fg("dim", `hit $${pricing.hit} / miss $${pricing.miss} per 1M`)}`),
       row(""),
       row(` ${th.fg("dim", "Esc 关闭")}`),
       th.fg("border", `╰${"─".repeat(inner)}╯`),
-    ];
+    );
+    return lines;
   }
 
   invalidate(): void {}
@@ -470,6 +571,21 @@ export default function (pi: ExtensionAPI) {
   let lastHitRate = hitRateHistory.length > 0
     ? hitRateHistory[hitRateHistory.length - 1].hitRate
     : 0;
+  /** 最近一轮的 hit/miss，用于展示按请求口径的命中率（官方逐次统计口径） */
+  let lastTurn: { read: number; miss: number } | undefined;
+  /** 当前 wire model，用于按官方价目表选价 */
+  let activeModel: string | undefined;
+  /** 官方 usage 无 cache write 字段；仅当观测到非零写入才展示该行 */
+  let reportsCacheWrite = false;
+  /** 缓存前缀被改写的累计次数 */
+  let prefixBreaks = 0;
+  /**
+   * 已知的可命中前缀集合。官方：cache prefix unit 独立完整、可并存，且未使用的条目
+   * 数小时至数日内才会清理（"best-effort"）。因此判定“本轮是否破坏了前缀”不能只看
+   * 上一轮——早期前缀回归时依然是有效命中。
+   */
+  const knownPrefixes: PrefixFingerprint[] = [];
+  const MAX_KNOWN_PREFIXES = 8;
 
   /** R2: 单一命中率计算函数 */
   const calcHitRate = (r: number, i: number): number =>
@@ -480,9 +596,16 @@ export default function (pi: ExtensionAPI) {
     if (event.message.role !== "assistant") return;
     const u = event.message.usage;
     if (!u) return;
-    cacheRead += u.cacheRead ?? 0;
-    input += u.input ?? 0;
-    cacheWrite += u.cacheWrite ?? 0;
+    const read = u.cacheRead ?? 0;
+    const miss = u.input ?? 0;
+    const write = u.cacheWrite ?? 0;
+    if (write > 0) reportsCacheWrite = true;
+    const m = event.message.model;
+    if (typeof m === "string" && m) activeModel = m;
+    lastTurn = { read, miss };
+    cacheRead += read;
+    input += miss;
+    cacheWrite += write;
     turns += 1;
 
     scheduleSaveStats({ cacheRead, input, cacheWrite, turns });
@@ -506,13 +629,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   // /cache-stats → overlay 弹窗
+  const buildStatsView = (): StatsView => {
+    const now = new Date();
+    return {
+      stats: { cacheRead, input, cacheWrite, turns },
+      lastTurnHitRate: lastTurn ? calcHitRate(lastTurn.read, lastTurn.miss) : undefined,
+      model: activeModel,
+      pricing: currentPricing(activeModel, now),
+      peak: isPeakWindow(now),
+      reportsCacheWrite,
+    };
+  };
+
   pi.registerCommand("cache-stats", {
     description: "DeepSeek 前缀缓存命中率",
     handler: async (_args, ctx) => {
       setExtensionCtx(ctx);
       await ctx.ui.custom(
         (_tui, theme, _kb, done) =>
-          new CacheStatsOverlay(theme, { cacheRead, input, cacheWrite, turns }, done),
+          new CacheStatsOverlay(theme, buildStatsView(), done),
         { overlay: true },
       );
     },
@@ -544,8 +679,10 @@ export default function (pi: ExtensionAPI) {
       turns = 0;
       hitRateHistory.length = 0;
       lastHitRate = 0;
-      lastPrefixHash = undefined;
-      lastPrefixLen = 0;
+      lastTurn = undefined;
+      activeModel = undefined;
+      reportsCacheWrite = false;
+      knownPrefixes.length = 0;
       prefixBreaks = 0;
       summaryCache.clear();
       flushPendingWrites();
@@ -566,60 +703,62 @@ export default function (pi: ExtensionAPI) {
     return { messages: onWire };
   });
 
-  // R1: 前缀指纹 → 缓存破坏诊断 (Harness: headerEquals+prefix包含检测, 参考 api-docs deepseek kv_cache 前缀完整匹配)
-  let lastPrefixHash: string | undefined;
-  let lastPrefixLen = 0;
-  let prefixBreaks = 0;
+  // R14: 前缀指纹 → 缓存破坏诊断
+  // 官方要求前缀完整匹配某个已落盘的 cache prefix unit；system + tools + messages 三段
+  // 均参与。pi-ai 的 openai-completions buildParams 把 system 并入 messages，但 tools 是
+  // 独立顶层字段 —— 旧实现只哈希 messages，导致工具增删/改 schema 击穿缓存时零告警。
   pi.on("before_provider_request", (event, ctx) => {
     setExtensionCtx(ctx);
     const payload = event.payload as Record<string, unknown> | null | undefined;
-    // 字节确定性：tools 按 Harness orderTools 码点字典序排序，避免工具顺序抖动击穿缓存 (harness: packages/core/system-prompt/src/index.ts:orderTools)
-    if (payload && typeof payload === "object") {
-      const toolsRaw = (payload as Record<string, unknown>).tools;
-      if (Array.isArray(toolsRaw) && toolsRaw.length > 1) {
-        const sorted = [...toolsRaw].sort((a: unknown, b: unknown) => {
-          const na = getToolName(a);
-          const nb = getToolName(b);
-          // 码点字典序（Harness orderTools parity）：localeCompare 依赖 ICU/locale，跨环境可能给出不同顺序
-          return na < nb ? -1 : na > nb ? 1 : 0;
-        });
-        const next = { ...(payload as Record<string, unknown>), tools: sorted };
-        // 保持 chain 可观测：prefix 字节一致性优先于原始工具顺序
-        // 返回替换 payload (runner.js:790 只当 !==undefined 才替换)
-        // 此处先完成前缀哈希诊断，排序后的 payload 由链式 runner 返回替换
-        const msgsForHash = Array.isArray((next as Record<string, unknown>).messages) ? ((next as Record<string, unknown>).messages as unknown[]) : [];
-        const prefixForHash = msgsForHash; // 完整消息列表（含最后一条），对齐官方 cache unit 边界（用户输入末尾落盘）
-        // 稳定序列化哈希，避免键序抖动误报 (harness: sameSchema JSON.stringify 有序, 此处用 stableStringify 兼容多 provider形态)
-        const curHash = prefixForHash.length === 0 ? undefined : hashMessages(prefixForHash);
-        const curLen = prefixForHash.length;
-        if (lastPrefixHash !== undefined && curHash !== undefined) {
-          const isAppend = curLen >= lastPrefixLen && hashMessages(prefixForHash.slice(0, lastPrefixLen)) === lastPrefixHash;
-          const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
-          if (!isAppend && !isEqual) {
-            prefixBreaks++;
-            ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
-          }
-        }
-        if (curHash !== undefined) { lastPrefixHash = curHash; lastPrefixLen = curLen; } else { lastPrefixHash = undefined; lastPrefixLen = 0; }
-        return next;
-      }
+    if (!payload || typeof payload !== "object") return;
+
+    // 字节确定性：tools 按 Harness orderTools 码点字典序排序，避免工具顺序抖动击穿缓存
+    const toolsRaw = payload.tools;
+    let next: Record<string, unknown> = payload;
+    let reordered = false;
+    if (Array.isArray(toolsRaw) && toolsRaw.length > 1) {
+      // 码点字典序（Harness orderTools parity）：localeCompare 依赖 ICU/locale，跨环境可能给出不同顺序
+      const sorted = [...toolsRaw].sort((a: unknown, b: unknown) => {
+        const na = getToolName(a);
+        const nb = getToolName(b);
+        return na < nb ? -1 : na > nb ? 1 : 0;
+      });
+      reordered = sorted.some((t, i) => t !== toolsRaw[i]);
+      if (reordered) next = { ...payload, tools: sorted };
     }
-    const rawMsgs = (payload && typeof payload === "object" && Array.isArray((payload as Record<string, unknown>).messages))
-      ? ((payload as Record<string, unknown>).messages as unknown[]) : [];
-    if (rawMsgs.length === 0) return; // 非payload 形态静默跳过，空前缀不告警 (Harness: deepseek-official only)
-    const prefix = rawMsgs; // 完整消息列表（rawMsgs.length > 0 已由 609 行保证）
-    const curHash = hashMessages(prefix);
-    const curLen = prefix.length;
-    if (lastPrefixHash !== undefined) {
-      const isAppend = curLen >= lastPrefixLen && hashMessages(prefix.slice(0, lastPrefixLen)) === lastPrefixHash;
-      const isEqual = curLen === lastPrefixLen && curHash === lastPrefixHash;
-      if (!isAppend && !isEqual) {
+
+    // 完整消息列表（含最后一条），对齐官方 cache unit 边界（用户输入末尾落盘）
+    const msgs = Array.isArray(next.messages) ? (next.messages as unknown[]) : [];
+    if (msgs.length === 0) return; // 非 payload 形态 / 空前缀：静默跳过，不告警
+
+    const fp: PrefixFingerprint = {
+      tools: hashMessages(Array.isArray(next.tools) ? next.tools : null),
+      messages: hashMessages(msgs),
+      len: msgs.length,
+    };
+
+    if (knownPrefixes.length > 0) {
+      // 追加式 = 本轮消息列表以某个已知前缀开头，且 tools 未变
+      const isContinuation = knownPrefixes.some(
+        (prev) =>
+          prev.tools === fp.tools &&
+          fp.len >= prev.len &&
+          hashMessages(msgs.slice(0, prev.len)) === prev.messages,
+      );
+      if (!isContinuation) {
         prefixBreaks++;
         ctx.ui.notify(`检测到缓存前缀变化（第 ${prefixBreaks} 次），本轮可能未命中缓存`, "warning");
       }
     }
-    lastPrefixHash = curHash;
-    lastPrefixLen = curLen;
+
+    // 去重后入队，保持有界（最新在最前）
+    const at = knownPrefixes.findIndex((p) => p.tools === fp.tools && p.messages === fp.messages);
+    if (at >= 0) knownPrefixes.splice(at, 1);
+    knownPrefixes.unshift(fp);
+    if (knownPrefixes.length > MAX_KNOWN_PREFIXES) knownPrefixes.length = MAX_KNOWN_PREFIXES;
+
+    // 返回替换 payload（runner 仅在 !==undefined 时替换）
+    return reordered ? next : undefined;
   });
 
   // ───────── P3 缓存友好的 compaction ─────────
@@ -637,9 +776,12 @@ export default function (pi: ExtensionAPI) {
 
     const key = createHash("sha256").update(text).digest("hex");
     let summary = summaryCache.get(key);
+    let summarizer = "deepseek-flash";
     if (!summary) {
-      summary = await summarizeWithFlash(text, ctx, signal);
-      if (!summary) return;
+      const fresh = await summarizeWithFlash(text, ctx, signal);
+      if (!fresh) return;
+      summary = fresh.summary;
+      summarizer = fresh.model;
       setSummaryCache(summaryCache, key, summary);
       saveSummaryCache(summaryCache); // R12: 新摘要落盘，跨会话复用
     }
@@ -649,14 +791,14 @@ export default function (pi: ExtensionAPI) {
         summary,
         firstKeptEntryId,
         tokensBefore,
-        details: { summarizer: "deepseek-v4-flash" },
+        details: { summarizer },
       },
     };
   });
 
   // 会话生命周期：切换/新会话时重置前缀指纹，避免旧会话哈希残留导致跨会话假阳性告警；
   // 退出时强制 flush（api-docs kv_cache best-effort 资源清理类比）
-  const resetPrefixFingerprint = () => { lastPrefixHash = undefined; lastPrefixLen = 0; };
+  const resetPrefixFingerprint = () => { knownPrefixes.length = 0; };
   pi.on("session_start", (_event, ctx) => { extensionCtx = ctx; resetPrefixFingerprint(); });
   pi.on("session_before_switch", () => { resetPrefixFingerprint(); });
   pi.on("session_shutdown", () => { flushPendingWrites(); });
@@ -666,10 +808,16 @@ async function summarizeWithFlash(
   text: string,
   ctx: ExtensionContext,
   signal: AbortSignal,
-): Promise<string | undefined> {
-  const model = ctx.modelRegistry.find("deepseek", "deepseek-v4-flash");
+): Promise<{ summary: string; model: string } | undefined> {
+  // 官方注(1)：`deepseek-flash` 为当前模型名，legacy 名 `deepseek-v4-flash` 仍受理但
+  // 模型已退役。两个名字都试，任一命中即可，避免 pi 模型目录跟进官方改名后静默失效。
+  let model;
+  for (const id of SUMMARIZER_CANDIDATES) {
+    model = ctx.modelRegistry.find("deepseek", id);
+    if (model) break;
+  }
   if (!model) {
-    ctx.ui.notify("找不到 deepseek-v4-flash,回退默认 compaction", "warning");
+    ctx.ui.notify(`找不到摘要模型（${SUMMARIZER_CANDIDATES.join(" / ")}）,回退默认 compaction`, "warning");
     return;
   }
 
@@ -709,7 +857,7 @@ async function summarizeWithFlash(
       .map((c: { text: string }) => c.text)
       .join("\n");
 
-    return summary.trim() || undefined;
+    return summary.trim() ? { summary: summary.trim(), model: model.id } : undefined;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(`flash 摘要失败:${msg},回退默认 compaction`, "error");

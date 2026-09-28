@@ -78,11 +78,11 @@ echo ""
 echo -e "${YELLOW}测试 3: 完整会话测试${NC}"
 echo "输入以下命令测试:"
 echo ""
-echo "  echo -e 'hello\\n/cache-stats' | node packages/coding-agent/dist/cli.js --extension $EXTENSION_PATH --model deepseek/deepseek-chat"
+echo "  echo -e 'hello\\n/cache-stats' | node packages/coding-agent/dist/cli.js --extension $EXTENSION_PATH --model deepseek/deepseek-v4-flash"
 echo ""
 
 # 实际测试
-OUTPUT=$(echo -e "hello\n/cache-stats" | node /Users/ruanbw/projects/bennett-agent/packages/coding-agent/dist/cli.js --extension "$EXTENSION_PATH" --model deepseek/deepseek-chat 2>&1)
+OUTPUT=$(echo -e "hello\n/cache-stats" | node /Users/ruanbw/projects/bennett-agent/packages/coding-agent/dist/cli.js --extension "$EXTENSION_PATH" --model deepseek/deepseek-v4-flash 2>&1)
 echo "输出 (前 20 行):"
 echo "$OUTPUT" | head -20
 echo ""
@@ -99,7 +99,7 @@ echo -e "${BLUE}=== 测试完成 ===${NC}"
 echo ""
 echo "如需交互式测试,请运行:"
 echo ""
-echo "  node packages/coding-agent/dist/cli.js --extension $EXTENSION_PATH --model deepseek/deepseek-chat"
+echo "  node packages/coding-agent/dist/cli.js --extension $EXTENSION_PATH --model deepseek/deepseek-v4-flash"
 echo ""
 echo "然后在会话中输入:"
 echo "  /cache-stats"

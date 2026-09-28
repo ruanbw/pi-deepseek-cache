@@ -1,5 +1,41 @@
 # pi-deepseek-cache 变更日志
 
+## v0.3.0 (2026-09-29): 对齐官方现行口径复查
+
+> 本次以官方 [Context Caching on Disk](https://api-docs.deepseek.com/guides/kv_cache)、[Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) 与 [V4.1-Flash 发布公告](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) 为 Ground Truth，核查实现与文档的一致性。修复 3 处会导致用户误判的实质错误（成本估算与 `deepseek-v4-pro` 计价、`tools` 前缀诊断盲区）、1 处指向不可用模型导致命令无法执行的文档与脚本问题，以及多处与官方现行口径不符的声明。
+
+### 修复
+
+- **成本估算与官方价目表脱节（严重）**：原常数 `0.014 / 0.44` 与注释标称的 `deepseek-v4-flash` 峰值价均不正确。`0.014` 是 2024 年 news0802 的首发 cache-hit 价（已下线）；`0.44` 约为 `deepseek-v4-pro` 的 input 成本，与注释标称的 flash 串了模型。现改为按官方价目表选价：`deepseek-flash`（含 legacy 名 `deepseek-v4-flash`）命中 0.006 / 未命中 0.30（每百万 token）。
+- **`deepseek-v4-pro` 计价错误（严重）**：官方公告 [V4.1-Flash](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) 明确“自 2026-09-14 04:00 UTC 起，所有 `deepseek-v4-pro` 请求路由至 V4.1-Flash 并按 V4.1-Flash 价结算，直至 V4.1-Pro 发布”。因此 pricing 页面上 v4-pro 的 0.044 / 1.32 已是历史价，实际结算应按 Flash 价。首版修复误信了该历史价列（会把 pro 用户节省额高估约 3 倍），现已按公告口径修正，并在代码注释中标明冲突与后续升级点。
+- **忽略 peak/off-peak 时段**：官方注(2) 定义峰值为 01:00-04:00 / 06:00-10:00 UTC 周一至五，谷值为峰值的一半。原实现只用峰价，导致约一半时间金额错误。现按调用时刻判定时段并自动减半，`/cache-stats` 直接展示所用模型、时段与单价。
+- **前缀指纹遗漏 `tools`（严重，诊断盲区）**：官方要求 `system` + `tools` + `messages` 三段整体完整匹配某个已落盘的 cache prefix unit。pi-ai 的 `openai-completions` `buildParams` 将 `system` 并入 `messages`，但 `tools` 是**独立顶层字段**；旧实现只哈希 `messages`，因此扩展增删工具或变更工具 schema 会击穿缓存却**零告警** —— 而这正是 pi 中最常见的破坏源。现将归一化后的 `tools` 单独纳入指纹。
+- **仅比对上一轮前缀**：官方 unit 独立完整、可并存，且未使用的条目数小时至数日内才清理。回落到早期已落盘前缀仍是有效命中（官方 Example 2）。现保留有界集合（`MAX_KNOWN_PREFIXES = 8`），命中任一即视为追加式。
+- **模型改名后摘要静默失效**：官方注(1) 明确 `deepseek-flash` 为当前模型名，legacy 名 `deepseek-v4-flash` 仍受理但模型已退役。原实现只查 legacy 名，一旦 pi 模型目录跟进官方改名即失效。现两个名字依次尝试，并按实际命中的名字记录 `details.summarizer`。
+- **`cacheWrite` 恒为 0 的死 UI**：官方 usage 仅提供 hit/miss，无 cache write 字段（pi-ai 读的 `prompt_tokens_details.cache_write_tokens` 永不下发）。现改为未观测到非零写入时隐藏「缓存写入」行。
+- **文档与脚本指向已停用模型**：`README.md` / `README.zh.md` / `INSTALL.md` / `NEXT-STEPS.md` / 3 个测试脚本均指示用户运行 `pi --model deepseek/deepseek-chat`。官方已于 2026-07-24 停用 `deepseek-chat` / `deepseek-reasoner`（二者从未是独立模型，只是 `deepseek-v4-flash` 的思考 / 非思考模式别名），且 `@earendil-works/pi-ai` 的 DeepSeek 目录里根本没有这两个 id（只有 `deepseek-v4-flash` / `deepseek-v4-pro`），该命令无法执行。已统一改为目录中真实存在的 `deepseek/deepseek-v4-flash` / `deepseek/deepseek-v4-pro`；同时在价目表中保留二者的同价映射，供旧会话与自建代理兜底。
+- **节省额精度**：flash 档谷值每百万命中仅省 $0.147，固定 2 位小数丢失有效信息。现小于 $1 用 4 位小数。
+
+### 文档修正
+
+- **「compaction verbatim 回放 parity」为伪声明**：`README.md` / `README.zh.md` 与原理文档均声称对齐 Harness `summarizeWithLlm` 的 verbatim 回放（`system+tools+shadowed messages` + 尾部指令），但实现是把历史序列化为**单条 user 消息**、不传 `system`/`tools` —— 架构上相反，导致每次 compaction 冷启动全量 prefill，拿不到 warm prefix。已改为显式标注「无 parity」，并在原理文档新增 §7.4 说明差异、后果与后续对齐路径。
+- **原理文档 §1.2 使用了已被取代的缓存模型**：表格中的「任意前缀重叠即复用」是 2024 年旧口径，与 §2 逐字引用的现行口径（Sliding Window Attention 下每个缓存前缀是独立完整单元，须**完整匹配**）自相矛盾。已按现行口径重写。
+- **64 token 粒度被当作现行约束**：该表述仅存于 2024 年 news0802，现行 kv_cache 指南已改为「独立完整 cache prefix unit」+「按固定 token 间隔切分」。§3.3 已改为并列两种口径并标注引用纪律。
+- **定价三套数字互相矛盾**：代码 `0.014/0.44`、文档 `0.027/0.27`、且两者均不对应现行价目表。§4.3 已改为直接列出官方价目表与时段规则，并说明本项目实现方式。
+- **摘要缓存「跨会话复用」措辞**：key 为 `sha256(序列化历史全文)`，需历史逐字节相同，跨会话几乎不可能命中。已注明真实命中场景为同会话内重复压缩。
+- **命中率口径混淆**：状态栏与图表为跨轮**累计**值，官方为**按请求逐次**统计。`/cache-stats` 现同时展示「累计命中率」与「本轮命中率」，并在故障排查中说明增删扩展等同于改写历史。
+- **过期引用**：`README`「up to 90% less」为 2024 年口径；原理文档中 `index.ts:NNN` 行号全部刷新。
+
+### 新增
+
+- 测试从 28 增至 52：覆盖官方价目表（flash / v4-pro 路由至 V4.1-Flash 故同价 / legacy 名同价 / 已停用别名兜底 / 未知模型保守下界 / peak 与 off-peak 折半）、`tools` 指纹（增删、schema 变更、顺序抖动不误报、消息追加不告警、历史改写告警、早期前缀回落视为命中、首轮不告警、会话切换重置、空 payload 静默跳过）、`cacheWrite` 行显隐、累计与本轮口径差异、摘要器模型名回退。
+- 测试隔离修复：`clearPersistedData()` 补上 `summary-cache.json`，消除跨用例的磁盘状态污染。
+
+### 验证
+
+- `npx tsc --noEmit`：4 处既有 SDK 形态不一致（`complete` 导出、`custom` 回调签名、`context` 事件名），与 0.2.1 相同，未新增。
+- `npx vitest run`：52 tests passed（0.2.1 为 28）。
+
 ## v0.2.1 (2026-09-07): 前缀缓存适配修复（基于官方文档复查）
 
 ### 修复

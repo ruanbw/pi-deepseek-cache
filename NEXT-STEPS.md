@@ -41,7 +41,7 @@ pi --extension ./index.ts
 
 ```bash
 # 启动交互式会话(使用 DeepSeek 模型)
-pi --extension ./index.ts --model deepseek/deepseek-chat
+pi --extension ./index.ts --model deepseek/deepseek-v4-flash
 
 # 进行多轮对话
 > 帮我写一个 Hello World 程序
@@ -185,7 +185,7 @@ pi --extension ./index.ts --print "/cache-stats"
 
 ```bash
 # 检查是否使用了正确的模型
-pi --extension ./index.ts --model deepseek/deepseek-chat
+pi --extension ./index.ts --model deepseek/deepseek-v4-flash
 
 # 检查 DEEPSEEK_API_KEY 是否设置
 echo $DEEPSEEK_API_KEY
@@ -211,7 +211,7 @@ pi --extension ./index.ts --print "test"
 
 ### 影响因素
 
-1. **模型稳定性**: deepseek/deepseek-chat 比 deepseek/deepseek-reasoner 更稳定
+1. **模型稳定性**: deepseek/deepseek-v4-flash 比 deepseek/deepseek-v4-pro 更稳定
 2. **工具调用频率**:频繁的工具调用可能影响前缀稳定性
 3. **Compaction 频率**:compaction 会导致前缀重置
 

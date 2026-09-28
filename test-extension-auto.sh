@@ -124,7 +124,7 @@ Say "hello"
 EOF
 
 # 运行 pi 并捕获输出
-OUTPUT=$($PI_CMD --extension "$EXTENSION_PATH" --print --no-session --model deepseek/deepseek-chat < "$TEMP_INPUT" 2>&1)
+OUTPUT=$($PI_CMD --extension "$EXTENSION_PATH" --print --no-session --model deepseek/deepseek-v4-flash < "$TEMP_INPUT" 2>&1)
 EXIT_CODE=$?
 
 # 清理临时文件

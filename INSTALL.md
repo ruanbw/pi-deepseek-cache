@@ -130,7 +130,7 @@ source ~/.zshrc
 
 ```bash
 # 使用 DeepSeek 模型
-pi --model deepseek/deepseek-chat
+pi --model deepseek/deepseek-v4-flash
 
 # 或使用默认模型（如果已配置）
 pi

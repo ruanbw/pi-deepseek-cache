@@ -1,6 +1,6 @@
 # 前缀缓存（Prefix Cache）原理
 
-> 本文提炼自 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 全库的文档、代码注释与官方 API 文档，解释 DeepSeek 前缀缓存为何能让长会话成本降低 90%，以及在 Harness / Pi 扩展中如何保住它。
+> 本文提炼自 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 全库的文档、代码注释与官方 API 文档，解释 DeepSeek 前缀缓存为何能让长会话的大部分输入按缓存命中费率结算，以及在 Harness / Pi 扩展中如何保住它。
 >
 > 官方 Ground Truth：[Context Caching — DeepSeek API Docs](https://api-docs.deepseek.com/guides/kv_cache)（本文第 2 章逐字摘录 /tmp/kv.html，原站 Docusaurus v3.1.0 渲染页）
 
@@ -24,16 +24,18 @@ DeepSeek 在 API 侧实现 **Context Caching on Disk**（硬盘缓存），与�
 | 特性 | 说明 |
 |------|------|
 | 默认开启 | 无需改代码、无需传参即生效（api-docs.deepseek.com/guides/kv_cache） |
-| 硬盘持久化 | 每次请求触发一次硬盘缓存构建；若后续请求与已持久化的前缀重叠，重叠部分直接从缓存读取，计为 cache hit |
-| 任意前缀逐字节相等即复用 | 不要求显式会话 ID，只要用户输入的前缀字节序列完全一致即可命中 |
+| 硬盘持久化 | 每次请求触发一次硬盘缓存构建；后续请求须**完整匹配**某个已落盘的 cache prefix unit 才计为 cache hit |
+| 前缀单元独立完整 | 受 Sliding Window Attention 机制影响，每个已缓存前缀是独立完整的单元，不存在“任意重叠即复用” |
+| 不要求显式会话 ID | 命中不依赖会话标识，只取决于请求前缀字节序列 |
 | 输出仍需推理 | 缓存只加速输入的 prefill，输出仍通过计算生成，受 temperature 等参数影响 |
 | Best-effort | 不保证 100% 命中；未使用的缓存条目数小时至数日内自动清理 |
 
-> 官方原文摘录（api-docs.deepseek.com/news/news0802 与 /guides/kv_cache）：
+> 官方原文摘录（api-docs.deepseek.com/guides/kv_cache 为当前口径；news0802 为 2024 首发口径，部分表述已被前者取代）：
 > - The DeepSeek API Context Caching on Disk Technology is enabled by default for all users.
-> - Each user request will trigger the construction of a hard disk cache. If subsequent requests have overlapping prefixes with previous requests, the overlapping part will only be fetched from the cache, which counts as a cache hit.
+> - Each user request will trigger the construction of a hard disk cache. If subsequent requests have overlapping prefixes with previous requests, the overlapping part will only be fetched from the cache, which counts as a cache hit. 〔首段总述，仍成立〕
+> - Due to the Sliding Window Attention mechanism, the storage and matching of cached prefixes differs from before. Each cached prefix is an independent, complete unit. A subsequent request can only hit the cache if it **fully matches** a cache prefix unit. 〔当前口径；与上方“任意重叠即复用”相反，以本条为准〕
 > - The cache system works on a best-effort basis and does not guarantee a 100% cache hit rate.
-> - The cache system uses 64 tokens as a storage unit; content less than 64 tokens will not be cached.
+> - The cache system uses 64 tokens as a storage unit; content less than 64 tokens will not be cached. 〔仅见于 news0802，现行 kv_cache 指南已不再列出此条，见 3.3〕
 
 ---
 
@@ -180,13 +182,14 @@ prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens
 - 任何字符级差异（多一个空格、工具顺序变化、时间戳、随机 ID）都会截断可复用前缀。
 - Harness 的 e2e 测试注释明确写道 The first request has nothing to hit; every later one shares its predecessor as a byte-identical prefix（request-cache.e2e.ts:91）。
 
-### 3.3 64 token 块粒度
+### 3.3 粒度口径：现行「固定 token 间隔」取代旧「64 token 存储单元」
 
-- 服务端以 64 tokens 为存储单元切分缓存；不足 64 tokens 的内容不会被缓存。
-- 因此较短的前缀即使完全一致也可能不产生命中；测试中刻意将 SYSTEM 写得足够长以 comfortably spans the provider cache-block granularity (64 tokens) from the very first request。
-- 推论：要稳定命中，静态前缀（system + 常用 tools）应远超 64 tokens，且保持稳定。
+- **现行口径（api-docs.deepseek.com/guides/kv_cache）**：受 Sliding Window Attention 影响，不再以 64 token 为存储单元，而是以「独立完整的 cache prefix unit」为单位，并在长输入/长输出上**按固定 token 间隔切分**出额外单元（Persistence at fixed token intervals），避免长前缀因永远到不了结束位置而完全无法缓存。
+- **旧口径（news0802，2024）**：The cache system uses 64 tokens as a storage unit; content less than 64 tokens will not be cached. 该表述仅存于首发公告，现行指南已不再列出。
+- 工程含义不变的部分：过短的前缀仍可能不产生可复用单元，静态前缀（system + tools）应保持稳定且足够长。
+- 引用纪律：涉及粒度时以现行指南的三种落盘时机为准，不得把 64 token 当作当前硬约束。
 
-> 官方口径（news0802）：The cache system uses 64 tokens as a storage unit; content less than 64 tokens will not be cached. 社区转述亦一致：DeepSeek Cache is keyed on a 64-token prefix chunk.
+> 历史说明：本文早期版本与 Harness e2e 测试注释均沿用 64 token 粒度（comfortably spans the provider cache-block granularity）。这属于旧口径的历史遗留描述，不代表现行服务端行为。
 
 ---
 
@@ -250,10 +253,34 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 观测点：assistant/message 事件上的 usage 即为生产环境可信的缓存观测（request-cache.e2e.ts:17 称为 per-step usage recorded on assistant/message events is the production observable）。
 
-### 4.3 计费含义
+### 4.3 计费含义与本项目计价
 
-- prompt_cache_hit_tokens / cached_tokens 按缓存命中单价计费（约 miss 的 10%）。
-- 本项目按 0.027 / 0.27 美元/百万 token 估算节省：saved = cacheRead/1e6 * (0.27 - 0.027)（见 index.ts 常量 COST_PER_MILLION_CACHE_READ / COST_PER_MILLION_INPUT）。
+- 缓存命中与未命中按**不同单价**计费，两者的差额即节省额。
+- **官方现行价目表**（[Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)，每百万 token，美元）：
+
+  | 模型 | 命中 peak | 命中 off-peak | 未命中 peak | 未命中 off-peak |
+  |---|---|---|---|---|
+  | `deepseek-flash`（= DeepSeek-V4.1-Flash） | 0.006 | 0.003 | 0.30 | 0.15 |
+  | `deepseek-v4-pro` | 0.044 | 0.022 | 1.32 | 0.66 |
+
+  峰值为 01:00-04:00 / 06:00-10:00 UTC 周一至五（官方注(2) 另排除中国公共假期），其余为谷值 = 峰值 / 2。
+
+- ⚠️ **但 v4-pro 行已不适用于实际结算**：官方公告 [Introducing DeepSeek-V4.1-Flash](https://www.deepseek.com/en/news/deepseek-v4-1-flash/) 明确 ——
+
+  > Starting at 04:00 UTC on Sept 14, 2026, all deepseek-v4-pro requests will route to V4.1-Flash at V4.1-Flash rates. This will continue until V4.1-Pro launches.
+
+  即自 2026-09-14 起，`deepseek-v4-pro` 的请求实际由 V4.1-Flash 服务并按 **Flash 价**结算；pricing 页面的 v4-pro 列是尚未下线的历史价。本扩展统计的是实际结算额，故**按公告口径取 Flash 价**，V4.1-Pro 上线后需单独加价。
+
+- 官方注(1)：legacy 名 `deepseek-v4-flash` 仍受理，但模型已退役，请求由 DeepSeek-V4.1-Flash 服务并按 Flash 价计费。
+- 官方已于 **2026-07-24** 停用 `deepseek-chat` / `deepseek-reasoner`（二者从未是独立模型，只是 `deepseek-v4-flash` 的思考 / 非思考模式别名）；本项目保留同价映射仅供旧会话与自建代理兜底。
+
+- **本项目实现**（`index.ts` `DEEPSEEK_PRICING` / `isPeakWindow` / `currentPricing`）：
+  - 按当前 wire model 选价目表，未知模型取保守下界（flash 谷值）而非高估；
+  - 按调用时刻判断 peak / off-peak，谷值自动减半；
+  - `saved = cacheRead / 1e6 * (miss − hit)`；
+  - `/cache-stats` 同时展示当前模型、时段与单价，避免黑盒数字。
+
+> 历史说明：本文早期版本与 v0.2.1 代码曾使用 0.027/0.27（后改为 0.014/0.44），二者均不对应现行价目表（0.014 是 2024 年 news0802 的首发 cache-hit 价，0.44 约为 pi-ai 中 `deepseek-v4-pro` 的 input 成本，与注释标称的 flash 不符）。已按官方价目表重写。
 
 ---
 
@@ -267,7 +294,7 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 | **Tools 变化** | 工具增删、JSON Schema 字段顺序变化 | 工具数组序列化参与前缀比较 |
 | **历史重写** | 编辑/重排已发送的 message、compaction 替换 head | compaction-basic 明确标记 Replacing rather than append-only. Each checkpoint invalidates reuse from the first replaced history token |
 | **路由变化** | 切换 provider/model | 见命中条件 3.1 |
-| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置 | 截断点之前的稳定前缀越短，可节省的 prefill 越少 |
+| **易变内容前置** | 将时间戳、随机 ID、大块非确定性工具输出放在靠前位置 | 使可复用单元变短；按官方现行口径，需**完整匹配**某个已落盘单元才能命中，故稳定内容应尽量越过所有易变段 |
 | **非追加式写入** | 持久化修复重写较早历史（Harness 已规避：修复结果 append） | 多个包文档强调 append without rewriting earlier history |
 
 > 设计原则：把稳定内容放前、易变内容放后、只追加不重写。
@@ -382,14 +409,14 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 | Pi 钩子 | 触发时机 | 复刻的 Harness 手段 | 本项目做法 |
 |---------|----------|---------------------|------------|
-| context | 每次组装上下文、即将并入请求前 | 固定 System Prompt 的易变内容后置与 append-only | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:559 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀 |
+| context | 每次组装上下文、即将并入请求前 | 固定 System Prompt 的易变内容后置与 append-only | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:687 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀 |
 | before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2 |
-| session_before_compact | 压缩前，允许扩展接管总结 | Compaction verbatim 回放 | 以 deepseek-v4-flash @ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json 跨会话复用（index.ts:623） |
+| session_before_compact | 压缩前，允许扩展接管总结 | Compaction verbatim 回放（**未对齐**，见 7.4） | 以 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结，结果按 SHA-256 去重并落盘 summary-cache.json |
 
 #### context — 易变内容隔离
 
 ```ts
-// index.ts:559
+// index.ts:687
 pi.on("context", async (event, ctx) => {
   const msgs = Array.isArray((event as any).messages) ? (event.messages as CachedMessage[]) : [];
   const onWire = msgs.filter((m) => m?.customType !== "volatile-scratch");
@@ -402,7 +429,7 @@ pi.on("context", async (event, ctx) => {
 #### before_provider_request — 发送前一致性门
 
 ```ts
-// index.ts:573 — 节选
+// index.ts:698 — 节选
 pi.on("before_provider_request", (event, ctx) => {
   const payload = event.payload as Record<string, unknown>;
   if (Array.isArray(payload.tools) && payload.tools.length > 1) {
@@ -411,9 +438,16 @@ pi.on("before_provider_request", (event, ctx) => {
       const na = getToolName(a), nb = getToolName(b);
       return na < nb ? -1 : na > nb ? 1 : 0;
     });
-    return { ...payload, tools: sorted }; // 覆盖工具顺序（已排序时内容等价）
+    // 仅在顺序确实改变时替换
+    if (sorted.some((t, i) => t !== payload.tools![i])) next = { ...payload, tools: sorted };
   }
-  // 对完整 messages 列表（含最后一条）做 SHA-256，检测非追加式前缀变化
+  // system + tools + messages 三段指纹（tools 为独立顶层字段，必须单独覆盖）
+  const fp: PrefixFingerprint = {
+    tools: hashMessages(Array.isArray(next.tools) ? next.tools : null),
+    messages: hashMessages(msgs),
+    len: msgs.length,
+  };
+  // 追加式 = 命中任一已知指纹且 tools 未变
 });
 ```
 
@@ -422,7 +456,7 @@ pi.on("before_provider_request", (event, ctx) => {
 #### session_before_compact — 缓存友好的确定性总结
 
 ```ts
-// index.ts:623
+// index.ts:754
 pi.on("session_before_compact", async (event, ctx) => {
   flushPendingWrites();
   const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } = event.preparation;
@@ -439,36 +473,57 @@ pi.on("session_before_compact", async (event, ctx) => {
 });
 ```
 
-对应 Harness：dsh-compaction-basic/lib/index.js:267 summarizeWithLlm 的 verbatim 回放；本项目额外以 temperature: 0 保证输出确定性，并以摘要缓存避免对同一前缀重复总结。
+#### 7.4 未对齐项：compaction 并非 verbatim 回放
+
+**Harness 的做法（见 6.5）**：总结器逐条回放会话自身的 `system`、`tools` 与被遮蔽区消息，仅在末尾追加一条 `COMPACTION_INSTRUCTION` 作为最后一条 user 消息，使辅助调用成为上一轮路由请求的**真前缀扩展**，从而复用 warm KV cache。
+
+**本项目的做法**（`index.ts` `summarizeWithFlash`）：把 `serializeConversation(...)` 的历史**序列化为单条 user 消息文本**，与指令拼接后一次发出；不传 `system`、不传 `tools`、不按消息逐条回放。
+
+**差异与后果**（不得再声称 parity）：
+
+| 维度 | Harness verbatim 回放 | 本项目 |
+|---|---|---|
+| 前缀形态 | 上一轮请求的真前缀扩展 | 全新前缀，与上一轮无字节重合 |
+| 缓存效果 | 复用 warm cache，仅 prefill 新增的指令 | 每次 compaction 冷启动，全量 prefill 整段历史 |
+| 稳定内容 | 指令置于最后，历史变动不影响前缀 | 指令与历史拼接在同一段文本内，历史一变即全量重算 |
+| 路由 | 透传原 provider/model | 固定走 `deepseek-flash`（官方注(1)：legacy 名已退役但仍受理） |
+
+补充：摘要缓存 key 为 `sha256(序列化历史全文)`，需历史**逐字节相同**才能命中。因此“跨会话复用”在实践中几乎不会发生（跨会话历史必然不同），真实命中场景是同会话内对同一压缩集合重复总结。
+
+> 若要真正对齐 Harness 6.5，需要改为按消息逐条回放 `system + tools + messages`、把指令作为最后一条 user 消息追加，并透传原会话的 provider/model。当前实现是**独立冷调用**，属于刻意的工程权衡（隔离主请求路由、保证 temperature 0 的确定性），而非等价实现。
 
 ### 7.2 本项目新增的三个强制点
 
 - **问题**：Pi 侧不同扩展注册工具的顺序不确定；若直接透传，wire 字节在 tools 段即分叉。
-- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:580）。
+- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅在顺序确实改变时以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:698）。
 - **与 Harness 一致性**：与 dsh-system-prompt/lib/index.js:44 orderTools 的回退分支语义一致（未配置 toolOrder 时按 compareToolNames 排序）；Pi 侧同样使用码点比较（localeCompare 依赖 ICU/locale，跨环境可能不同序，已弃用）。
-- **可观测**：排序覆盖会连带触发前缀哈希的重新计算，保证诊断基于归一化后的字节。
+- **可观测**：排序先于指纹计算，诊断基于归一化后的字节。
 
 #### 2. 前缀包含检测（Prefix Containment Check）
 
 - **问题**：官方要求完整匹配已持久化的 cache prefix unit，但开发期更关心本轮请求是否仍是上一轮的追加——非追加即可能 miss。
-- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）做 stableStringify 到 SHA-256，记录 lastPrefixHash / lastPrefixLen；每轮比较 hash(prefix.slice(0, lastLen)) === lastHash 判断是否为追加，否则 prefixBreaks++ 并 ctx.ui.notify 告警（index.ts:591、index.ts:610）。
-- **与 Harness 一致性**：Harness 以 foldRequestHeader + headerEquals 判断 envelope 是否变化，以 session.deriveMessages() 重建历史；本项目在 wire 侧以哈希等价实现前缀包含检测，二者互补——前者保 envelope，后者保 messages 前缀的追加性。
-- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:55）。
+- **覆盖面（重要）**：指纹必须同时覆盖 `system`、`tools`、`messages` 三段。pi-ai 的 `openai-completions` `buildParams` 把 `system` 并入 `messages`，但 **`tools` 是独立顶层字段**；早期实现只哈希 `messages`，导致工具增删或 schema 变更击穿缓存时零告警。现已对 `tools` 单独取 `stableStringify` + SHA-256 并纳入比对。
+- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）与归一化后的 tools 分别做 stableStringify + SHA-256，组成 `PrefixFingerprint { tools, messages, len }`；本轮为追加式 = 消息列表以某个已知指纹开头**且 tools 指纹未变**，否则 `prefixBreaks++` 并 `ctx.ui.notify` 告警（index.ts:698）。
+- **多指纹集合**：官方 unit 独立完整、可并存，且未使用的条目数小时至数日内才清理。因此判定“是否破坏前缀”不能只看上一轮——回落到早期已落盘前缀仍是有效命中（官方 Example 2）。实现保留有界集合（`MAX_KNOWN_PREFIXES = 8`），命中任一即视为追加式。
+- **与 Harness 一致性**：Harness 以 foldRequestHeader + headerEquals 判断 envelope 是否变化，以 session.deriveMessages() 重建历史；本项目在 wire 侧以哈希等价实现前缀包含检测，二者互补——前者保 envelope（含 system/tools），后者保 messages 前缀的追加性。
+- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:126）。
 
 #### 3. 原子落盘（Atomic Persistence）
 
 - **问题**：统计与摘要缓存若以非原子写落盘，崩溃时可能产生半截 JSON，导致下次启动误判或丢失命中归因。
-- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:76）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
+- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:147）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
 - **与 Harness 一致性**：Harness 会话存储（JSONL/SQLite）亦保证 Persistence does not mutate live request prefixes 且修复结果 append 而非重写；本项目在扩展侧以原子文件语义延续同一不变量。
 
 ### 7.3 遥测与可视化（P1）
 
 | 能力 | 实现 |
 |------|------|
-| 监听 message_end 累积 cacheRead / input / cacheWrite / turns | index.ts message_end 处理 |
+| 监听 message_end 累积 cacheRead / input / cacheWrite / turns，并记录 wire model | index.ts message_end 处理 |
 | 落盘 ~/.pi/agent/extensions/deepseek-cache/stats.json | atomicWriteJson |
-| 状态栏实时显示 cache xx.x% · Nt | index.ts status bar |
-| /cache-stats 与 /cache-graph 可视化，预估节省 saved = cacheRead/1e6 * (0.27 - 0.027) | index.ts 命令注册 |
+| 状态栏实时显示 cache xx.x% · Nt（累计口径） | index.ts status bar |
+| /cache-stats 同时展示**累计**命中率与**本轮**命中率（官方为按请求逐次统计口径，两者不同） | index.ts `StatsView.lastTurnHitRate` |
+| 节省额按当前模型 + peak/off-peak 时段计价（`saved = cacheRead/1e6 * (miss − hit)`），并展示所用模型、时段与单价；小额用 4 位小数避免丢失有效信息 | index.ts `currentPricing` / `buildStatsView` |
+| 官方 usage 无 cache write 字段，未观测到非零写入时隐藏「缓存写入」行（避免恒为 0 的死 UI） | index.ts `reportsCacheWrite` |
 
 ---
 
@@ -476,8 +531,8 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 - **DeepSeek 官方**
   - [Context Caching — DeepSeek API Docs](https://api-docs.deepseek.com/guides/kv_cache) — 硬盘缓存总述、三种持久化、两示例、计费二字段、best-effort（本文第 2 章 Ground Truth 来源）
-  - [API Introduces Context Caching on Disk — News 2024-08-02](https://api-docs.deepseek.com/news/news0802) — 首次发布、定价降至 1/10、64 token 单元
-  - [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) — cache-hit 约为 miss 的 10% 单价（本项目按 0.027 / 0.27 美元/百万 token 估算）
+  - [API Introduces Context Caching on Disk — News 2024-08-02](https://api-docs.deepseek.com/news/news0802) — 首次发布。**旧口径参考**：其中 “cache hit $0.014/M、miss $0.14/M” 与 “64 token 存储单元” 均为 2024 年首发价与旧粒度，已被现行价目表与现行缓存粒度取代（见 3.3 / 4.3）
+  - [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing) — 现行价目表、peak/off-peak 规则（官方注(2)）、legacy 模型名说明（官方注(1)）；本项目按该表与时段计价
 
 - **Harness 源码（相对 deepseek-harness 仓库根；安装产物路径见第 6 章表格）**
   - packages/llm/llm-deepseek/README.md — deepseek-official 路由与适配器
@@ -487,7 +542,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   - docs/subsystems/llm-streaming.md#TokenUsage — TokenUsage 不相交计量契约
   - packages/compaction/compaction-basic/src/summarizer.ts:72 — replay verbatim to reuse warm prefix cache
   - packages/compaction/compaction-basic/README.md:18,101,152-156 — 总结的前缀复用与 KV Cache effect
-  - packages/core/agent-loop/tests/request-cache.e2e.ts — 真实 API 的 cacheReadTokens > 0 证明与 64-token 粒度注释
+  - packages/core/agent-loop/tests/request-cache.e2e.ts — 真实 API 的 cacheReadTokens > 0 证明（其中 64-token 粒度注释属旧口径，见 3.3）
   - packages/session/session-persistence/README.md:79 — 持久化不改前缀、命中需 history + envelope + route 一致
   - node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js:44,54,240,263,280 — PromptSection/orderTools/compareToolNames/assemble
   - node_modules/@deepseek-ai/dsh-session/lib/types/request-header.js:17,29,38,57 — canonicalHeader/sameSchema/headerEquals/foldRequestHeader
@@ -497,13 +552,15 @@ pi.on("session_before_compact", async (event, ctx) => {
   - node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:212,267,280,294 — COMPACTION_INSTRUCTION / summarizeWithLlm verbatim 回放
 
 - **本项目**
-  - index.ts:55 — stableStringify 字节稳定序列化
-  - index.ts:76 — atomicWriteJson 原子落盘
-  - index.ts:559 — context 易变隔离
-  - index.ts:570 — before_provider_request 工具排序 + 前缀包含检测
-  - index.ts:623 — session_before_compact 确定性总结与摘要缓存
+  - index.ts:126 — stableStringify 字节稳定序列化
+  - index.ts:147 — atomicWriteJson 原子落盘
+  - index.ts:33 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak 与 legacy 名）
+  - index.ts:687 — context 易变隔离
+  - index.ts:698 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹
+  - index.ts:754 — session_before_compact 确定性总结与摘要缓存
+  - index.ts:795 — summarizeWithFlash 独立冷调用（非 verbatim 回放，见 7.4）
   - README.md — 功能总览与 [DeepSeek Context Caching docs](https://api-docs.deepseek.com/guides/kv_cache) 入口
 
 ---
 
-*最后更新：2026-08-20 · 维护者：pi-deepseek-cache*
+*最后更新：2026-09-29（对齐官方现行 kv_cache 口径与现行价目表）· 维护者：pi-deepseek-cache*
