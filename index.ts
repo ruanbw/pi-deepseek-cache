@@ -453,6 +453,12 @@ interface StatsView {
 interface PrefixFingerprint {
   tools: string;
   messages: string;
+  /**
+   * 去掉末条消息后的哈希。末条可能是本轮才注入、并不落历史的临时块
+   * （例如 plan-build 每轮在消息数组尾部追加的计划状态块），下一轮该位置
+   * 会被真实历史取代 —— 用严格全量比对会把这种正常追加误判成断链。
+   */
+  head: string;
   len: number;
 }
 
@@ -1292,17 +1298,23 @@ export default function (pi: ExtensionAPI) {
     const fp: PrefixFingerprint = {
       tools: hashMessages(Array.isArray(next.tools) ? next.tools : null),
       messages: hashMessages(msgs),
+      head: msgs.length > 1 ? hashMessages(msgs.slice(0, -1)) : "",
       len: msgs.length,
     };
 
     if (knownPrefixes.length > 0) {
-      // 追加式 = 本轮消息列表以某个已知前缀开头，且 tools 未变
-      const isContinuation = knownPrefixes.some(
-        (prev) =>
-          prev.tools === fp.tools &&
-          fp.len >= prev.len &&
-          hashMessages(msgs.slice(0, prev.len)) === prev.messages,
-      );
+      // 追加式 = 本轮消息列表以某个已知前缀开头，且 tools 未变。
+      // 先做全量严格比对；失败再看"忽略上一份末条"的宽松比对：上一份的最后一条
+      // 若是不入历史的临时注入块（plan-build 计划块 / todo 状态块），本轮同一位置
+      // 必然是真实历史消息，严格比对注定失败 —— 那是误报，不是断链。
+      // 宽松比对仅限"本轮确实变长"（fp.len > prev.len）：等长而末条被改、或历史被
+      // 压缩变短，都仍按断链告警。中间任意位置被改写、或 tools 变化，两条比对同时失败。
+      const isContinuation = knownPrefixes.some((prev) => {
+        if (prev.tools !== fp.tools || fp.len < prev.len) return false;
+        if (hashMessages(msgs.slice(0, prev.len)) === prev.messages) return true;
+        if (fp.len <= prev.len || prev.len < 2) return false;
+        return hashMessages(msgs.slice(0, prev.len - 1)) === prev.head;
+      });
       if (!isContinuation) {
         prefixBreaks++;
         ctx.ui.notify(strings.prefixChanged(prefixBreaks), "warning");

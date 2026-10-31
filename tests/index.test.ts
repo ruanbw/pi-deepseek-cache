@@ -1339,3 +1339,73 @@ describe("R18: warming helpers", () => {
     expect(shouldVetoWarming({ turns: 9, cacheRead: 1 })).toBe(false);
   });
 });
+
+// ═══ R19: 尾部临时注入块不得误报断链 ═══
+describe("R19: 尾部临时注入块不误报", () => {
+  let api: ReturnType<typeof createMockExtensionAPI>;
+  let bpr: Listener;
+  const TOOLS = [{ name: "read" }];
+  const HIST = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "第一问" },
+    { role: "assistant", content: "第一答" },
+  ];
+  // plan-build 每轮追加到消息数组末尾的计划状态块：不落历史
+  const block = (text: string) => ({ role: "user", content: `<system-reminder>${text}` });
+
+  beforeEach(() => {
+    clearPersistedData();
+    mockCtx.ui.notify.mockClear();
+    api = createMockExtensionAPI();
+    index(asApi(api));
+    bpr = listenerFor(api, "before_provider_request");
+  });
+  const send = (messages: unknown[], tools: unknown = TOOLS) =>
+    bpr({ payload: { tools, messages } }, mockCtx);
+
+  it("上一轮末条是注入块、本轮该位置换成真实历史 → 不告警", () => {
+    send([...HIST, block("计划状态 A")]);
+    expect(mockCtx.ui.notify).not.toHaveBeenCalled();
+    // 本轮：注入块不存在，同一位置是助手回复；尾部再追加新块
+    send([...HIST, { role: "assistant", content: "工具结果后" }, block("计划状态 B")]);
+    expect(mockCtx.ui.notify).not.toHaveBeenCalled();
+    send([
+      ...HIST,
+      { role: "assistant", content: "工具结果后" },
+      { role: "user", content: "第二问" },
+    ]);
+    expect(mockCtx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("中间历史被改写仍然告警", () => {
+    send([...HIST, block("计划状态 A")]);
+    send([
+      { role: "system", content: "sys" },
+      { role: "user", content: "REWRITTEN" },
+      { role: "assistant", content: "第一答" },
+      block("计划状态 B"),
+    ]);
+    expect(mockCtx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining(PREFIX_BREAK_WARNING),
+      "warning",
+    );
+  });
+
+  it("尾部注入块场景下 tools 变化仍然告警", () => {
+    send([...HIST, block("计划状态 A")]);
+    send([...HIST, block("计划状态 A")], [{ name: "read" }, { name: "edit" }]);
+    expect(mockCtx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining(PREFIX_BREAK_WARNING),
+      "warning",
+    );
+  });
+
+  it("历史被压缩变短仍然告警", () => {
+    send([...HIST, block("计划状态 A")]);
+    send([{ role: "system", content: "sys" }, block("计划状态 B")]);
+    expect(mockCtx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining(PREFIX_BREAK_WARNING),
+      "warning",
+    );
+  });
+});
