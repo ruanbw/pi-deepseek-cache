@@ -436,14 +436,14 @@ export function mapUsage(usage: WireUsage): TokenUsage {
 
 | Pi 钩子                 | 触发时机                          | 复刻的 Harness 手段                                             | 本项目做法                                                                                                                                                                                                                      |
 | ----------------------- | --------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| context                 | 每次组装上下文、即将并入请求前    | 固定 System Prompt 的易变内容后置与 append-only                 | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:738 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀                                                                                              |
+| context                 | 每次组装上下文、即将并入请求前    | 固定 System Prompt 的易变内容后置与 append-only                 | 过滤 customType volatile-scratch 的易变消息，使其不进入 wire 前缀（index.ts:1258 pi.on(context, ...)），避免时间戳/草稿截断稳定前缀                                                                                             |
 | before_provider_request | provider payload 已组装、尚未发送 | 工具字典序 + Wire 确定性序列化 + 请求头折叠的发送前最后一致性门 | 见 7.2                                                                                                                                                                                                                          |
 | session_before_compact  | 压缩前，允许扩展接管总结          | Compaction verbatim 回放（**未对齐**，见 7.4）                  | 以官方 `deepseek-flash`（兼容 legacy 名 `deepseek-v4-flash`）@ temperature 0 做确定性总结；官方模型不存在时按「当前模型已是 flash 档 → 当前 provider 的 flash 档 → 当前模型」回退，结果按 SHA-256 去重并落盘 summary-cache.json |
 
 #### context — 易变内容隔离
 
 ```ts
-// index.ts:738
+// index.ts:1258
 pi.on("context", async (event, ctx) => {
   if (!Array.isArray(event.messages)) return undefined;
   const onWire = event.messages.filter(
@@ -458,7 +458,7 @@ pi.on("context", async (event, ctx) => {
 #### before_provider_request — 发送前一致性门
 
 ```ts
-// index.ts:754 — 节选
+// index.ts:1274 — 节选
 pi.on("before_provider_request", (event, ctx) => {
   const payload = event.payload as Record<string, unknown>;
   if (Array.isArray(payload.tools) && payload.tools.length > 1) {
@@ -475,9 +475,10 @@ pi.on("before_provider_request", (event, ctx) => {
   const fp: PrefixFingerprint = {
     tools: hashMessages(Array.isArray(next.tools) ? next.tools : null),
     messages: hashMessages(msgs),
+    head: msgs.length > 1 ? hashMessages(msgs.slice(0, -1)) : "",
     len: msgs.length,
   };
-  // 追加式 = 命中任一已知指纹且 tools 未变
+  // 追加式 = 命中任一已知指纹且 tools 未变；末条是临时注入块时走宽松分支
 });
 ```
 
@@ -486,7 +487,7 @@ pi.on("before_provider_request", (event, ctx) => {
 #### session_before_compact — 缓存友好的确定性总结
 
 ```ts
-// index.ts:810
+// index.ts:1336
 pi.on("session_before_compact", async (event, ctx) => {
   flushPendingWrites();
   const { messagesToSummarize, firstKeptEntryId, tokensBefore, previousSummary } =
@@ -535,7 +536,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 ### 7.2 本项目新增的三个强制点
 
 - **问题**：Pi 侧不同扩展注册工具的顺序不确定；若直接透传，wire 字节在 tools 段即分叉。
-- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅在顺序确实改变时以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:754）。
+- **做法**：在 before_provider_request 中对 payload.tools 按 getToolName 的码点字典序排序，仅在顺序确实改变时以 `{...payload, tools: sorted}` 非破坏性返回替换（index.ts:1274）。
 - **与 Harness 一致性**：与 dsh-system-prompt/lib/index.js:44 orderTools 的回退分支语义一致（未配置 toolOrder 时按 compareToolNames 排序）；Pi 侧同样使用码点比较（localeCompare 依赖 ICU/locale，跨环境可能不同序，已弃用）。
 - **可观测**：排序先于指纹计算，诊断基于归一化后的字节。
 
@@ -543,10 +544,12 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 - **问题**：官方要求完整匹配已持久化的 cache prefix unit，但开发期更关心本轮请求是否仍是上一轮的追加——非追加即可能 miss。
 - **覆盖面（重要）**：指纹必须同时覆盖 `system`、`tools`、`messages` 三段。pi-ai 的 `openai-completions` `buildParams` 把 `system` 并入 `messages`，但 **`tools` 是独立顶层字段**；早期实现只哈希 `messages`，导致工具增删或 schema 变更击穿缓存时零告警。现已对 `tools` 单独取 `stableStringify` + SHA-256 并纳入比对。
-- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）与归一化后的 tools 分别做 stableStringify + SHA-256，组成 `PrefixFingerprint { tools, messages, len }`；本轮为追加式 = 消息列表以某个已知指纹开头**且 tools 指纹未变**，否则 `prefixBreaks++` 并 `ctx.ui.notify` 告警（index.ts:794）。
+- **做法**：对完整 messages 列表（含最后一条，对齐官方 cache unit 落盘边界——用户输入末尾）与归一化后的 tools 分别做 stableStringify + SHA-256，组成 `PrefixFingerprint { tools, messages, head, len }`；本轮为追加式 = 消息列表以某个已知指纹开头**且 tools 指纹未变**，否则 `prefixBreaks++` 并 `ctx.ui.notify` 告警（index.ts:1320）。
+- **尾部临时注入块（勿误报）**：有些扩展为不击穿 provider 前缀缓存，会把每轮才生成、**不落历史**的临时块（`@wbline/pi-plan-build` 的计划状态、todo 状态）追加到消息数组**末尾**；下一轮该位置被真实历史（助手回复）取代，严格全量比对必然失败 → 每轮刷一次告警，而真实命中率毫无变化。因此追加式判断分两级：先全量严格比对（语义不变）；失败后再比“忽略上一份末条”，由 `head`（存入时算一次的去掉末条哈希）直接命中，**且仅当本轮 `messages.length` 变大时启用**。等长而末条被改写、历史被压缩变短、中间任意位置被改写、tools 增删/schema 变化，四种情况两条比对同时失败 → 照常告警。
+- **为何不改成让注入方打标记**：要求每个做尾部注入的扩展都配合改 `customType`，且内容格式一改就静默失效；追加式判据本身才是错的那个（`volatile-scratch` 过滤只覆盖带 `customType` 的自定义消息，见 1 节）。
 - **多指纹集合**：官方 unit 独立完整、可并存，且未使用的条目数小时至数日内才清理。因此判定“是否破坏前缀”不能只看上一轮——回落到早期已落盘前缀仍是有效命中（官方 Example 2）。实现保留有界集合（`MAX_KNOWN_PREFIXES = 8`），命中任一即视为追加式。
 - **与 Harness 一致性**：Harness 以 foldRequestHeader + headerEquals 判断 envelope 是否变化，以 session.deriveMessages() 重建历史；本项目在 wire 侧以哈希等价实现前缀包含检测，二者互补——前者保 envelope（含 system/tools），后者保 messages 前缀的追加性。
-- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:172）。
+- **序列化稳定性**：使用 stableStringify（键按字典序排序，数组保持原序，递归稳定）避免同一语义因键序抖动而误报 break（index.ts:466）。
 - **哈希对象是 wire payload 而非重建历史**：指纹直接哈希即将发送的 `payload.messages`，因此凡是会影响前缀的字段（包括 pi 按 `requiresReasoningContentOnAssistantMessages` 回放的 `reasoning_content`、`content` 数组形态的图片块等）无需特例即被覆盖。两端边界需知情：
   - 官方 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)：携带 `tools` 时历史 `reasoning_content` 会拼接进上下文（因此变动它就是真实击穿，告警正确）；不携带 `tools` 时它被忽略，此时因它变动而告警属误报。pi 的模型目录对两个 DeepSeek 模型都标为 `requiresReasoningContentOnAssistantMessages: true`，且 pi 恒发工具，故实际不会命中误报分支。
   - `user_id` 是官方文档明列的 KVCache 隔离维度（[Rate Limit & Isolation](https://api-docs.deepseek.com/quick_start/rate_limit)），但 pi 不发送该字段，因此本扩展未将其纳入指纹；若将来 pi 开始发送按会话轮换的 `user_id`，需同步加入，否则会出现“前缀完全一致但命中率骤降”的哑否。
@@ -554,7 +557,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 #### 3. 原子落盘（Atomic Persistence）
 
 - **问题**：统计与摘要缓存若以非原子写落盘，崩溃时可能产生半截 JSON，导致下次启动误判或丢失命中归因。
-- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:193）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
+- **做法**：atomicWriteJson 先写入 path.pid.tmp，再 renameSync 原子替换（index.ts:505）；所有持久化（stats.json / summary-cache.json / hitRateHistory）均经此路径，配合 session_shutdown 与 session_before_compact 前的 flushPendingWrites()，保证退出必 flush与压缩前必 flush。
 - **与 Harness 一致性**：Harness 会话存储（JSONL/SQLite）亦保证 Persistence does not mutate live request prefixes 且修复结果 append 而非重写；本项目在扩展侧以原子文件语义延续同一不变量。
 
 ### 7.3 遥测与可视化（P1）
@@ -617,15 +620,15 @@ pi.on("session_before_compact", async (event, ctx) => {
   - node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js:212,267,280,294 — COMPACTION_INSTRUCTION / summarizeWithLlm verbatim 回放
 
 - **本项目**
-  - index.ts:172 — stableStringify 字节稳定序列化
-  - index.ts:193 — atomicWriteJson 原子落盘
-  - index.ts:41 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak、v4-pro 独立价与 legacy 名）；v0.5 起为**兜底**，优先取模型目录 cost（见 4.3）
-  - index.ts:83 — CN_PUBLIC_HOLIDAYS 中国公共假期（峰值窗口排除）
-  - index.ts:100 — isPeakWindow 峰值/谷值判定
-  - index.ts:738 — context 易变隔离
-  - index.ts:754 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹
-  - index.ts:810 — session_before_compact 确定性总结与摘要缓存
-  - index.ts:878 — summarizeWithModel 独立冷调用（非 verbatim 回放，见 7.4）
+  - index.ts:466 — stableStringify 字节稳定序列化
+  - index.ts:505 — atomicWriteJson 原子落盘
+  - index.ts:46 — DEEPSEEK_PRICING 官方价目表（含 peak/off-peak、v4-pro 独立价与 legacy 名）；v0.5 起为**兜底**，优先取模型目录 cost（见 4.3）
+  - index.ts:88 — CN_PUBLIC_HOLIDAYS 中国公共假期（峰值窗口排除）
+  - index.ts:105 — isPeakWindow 峰值/谷值判定
+  - index.ts:1258 — context 易变隔离
+  - index.ts:1274 — before_provider_request 工具排序 + system/tools/messages 三段前缀指纹（含尾部注入块的两级追加式判定）
+  - index.ts:1336 — session_before_compact 确定性总结与摘要缓存
+  - index.ts:1538 — summarizeWithModel 独立冷调用（非 verbatim 回放，见 7.4）
   - README.md — 功能总览与 [DeepSeek Context Caching docs](https://api-docs.deepseek.com/guides/kv_cache) 入口
 
 ---

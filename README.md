@@ -33,7 +33,7 @@ In long agent sessions that's surprisingly hard:
 
 - **Prefix Guard** — strips `volatile-scratch` messages from the context to keep the prompt prefix stable across turns
 - **Stable Tool Ordering** — lexicographically sorts `tools` in `before_provider_request` (Harness `orderTools` parity) so tool-list order jitter never breaks the cache
-- **Cache Break Diagnostics** — fingerprints the full `system` + `tools` + `messages` prefix (stable-JSON + SHA-256) and warns only when an existing prefix is rewritten, not on normal append; returning to any still-live earlier prefix counts as a valid hit; empty/unknown payloads are silently skipped
+- **Cache Break Diagnostics** — fingerprints the full `system` + `tools` + `messages` prefix (stable-JSON + SHA-256) and warns only when an existing prefix is rewritten, not on normal append — including when the previous turn ended with a tail-injected transient block that never enters history (e.g. `@wbline/pi-plan-build`'s plan state); returning to any still-live earlier prefix counts as a valid hit; empty/unknown payloads are silently skipped
 - **Hit Rate Telemetry** — accumulates `cacheRead` / `input` / `cacheWrite` / `turns` **per model** from every response and persists to disk, so switching models never blends two different price points into one number
 - **Live Status Bar** — see the _current model's_ cumulative hit rate and turn count in the Pi footer after every message
 - **ASCII Trend Chart** — visualize the all-models-cumulative hit rate over time with `/cache-graph` (flat-rate handling + fixed chart labels)
