@@ -1,9 +1,10 @@
 # pi-deepseek-cache 变更日志
 
-## 未发布
+## v0.6.1
 
 ### 修复
 
+- **CI 的 Audit 步骤恒挂**：`npm audit --audit-level=moderate` 把 eslint 工具链与宿主 devDep `@earendil-works/pi-coding-agent` 的传递依赖（`undici`）一起算进来，而这些既不会随包发布也不会进用户运行时。改为 `--omit=dev`，审计口径对齐实际随附内容（本包 `package.json` 无 `dependencies`，pi 包走 `peerDependencies`）。此前该步骤失败会让 lint / tsc / test 三步全部被跳过。
 - **尾部临时注入块导致的"缓存前缀变化"误报（每轮刷屏）**：`before_provider_request` 的前缀指纹用"上一份 payload 是否为本轮消息数组的真前缀"判断追加式请求。若有扩展每轮在消息数组**尾部**追加一条不入历史的临时块（典型：`@wbline/pi-plan-build` 的计划状态块，为对齐 provider 前缀缓存而刻意锚定在末尾），那么下一轮该位置必然被真实历史消息（助手回复）取代 —— 严格比对注定失败，于是**每次请求都报一次** `Cache prefix changed (#N)`，尽管 `cacheRead / prompt` 实测在 0.96 以上、真实断链为 0。
 
   现在追加式判断升级为两级：先做全量严格比对（原有语义不变）；失败后再做一次"忽略上一份末条"的宽松比对，且**仅在本轮确实变长（`messages.length` 增大）时启用**。等长而末条被改写、历史被压缩变短、中间任意位置被改写、以及 tools 增删/schema 变化，仍然全部照常告警 —— 只有"上一份末条是不入历史的注入块"这一类误报被吸收。新增 `R19` 四条回归用例覆盖该分支。
