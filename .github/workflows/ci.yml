@@ -23,8 +23,11 @@ jobs:
 
       - run: npm ci
 
-      - name: Audit (moderate+)
-        run: npm audit --audit-level=moderate
+      # 只审计本包实际随附的依赖：package.json 没有 dependencies，宿主 pi 包走
+      # peerDependencies、其余全是 devDependencies。全量 audit 会把 eslint 工具链
+      # 与宿主 devDep 的传递告警算进来，而这些既不会发布也不会进用户运行时。
+      - name: Audit (moderate+, shipped deps)
+        run: npm audit --omit=dev --audit-level=moderate
 
       - name: Lint
         run: npm run lint
